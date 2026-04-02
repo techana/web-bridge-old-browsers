@@ -162,6 +162,7 @@ DROP_TAGS = frozenset({
     "script", "style", "base",
     "iframe", "video", "audio", "canvas", "object", "embed",
     "template", "slot", "portal",
+    "transition", "transition-group",
 })
 
 # Tags removed but whose children are KEPT (unwrapped).
@@ -219,6 +220,9 @@ _LAZY_SRC = ("data-src", "data-original", "data-lazy",
 
 _MAIN_ID_RE  = re.compile(r"\b(main|content|article|post|entry|body|text|story)\b", re.I)
 _MAIN_CLS_RE = re.compile(r"\b(main|content|article|post|entry|body|text|story)\b", re.I)
+# Patterns that strongly indicate article content (scored higher than generic matches)
+_ARTICLE_ID_RE  = re.compile(r"\b(article|post|entry|story)\b", re.I)
+_ARTICLE_CLS_RE = re.compile(r"\b(article|post|entry|story)\b", re.I)
 
 
 # ── CSS layout parser ─────────────────────────────────────────────────────
@@ -1160,25 +1164,47 @@ def _render_xenforo(soup, page_url, proxy_host, cp1256=False):
 def _find_main(soup):
     """
     Return the tag most likely to contain the main article content.
-    Tries <main>, then id/class hints (preferring the largest match),
-    then falls back to <body>.
+    Tries <main>, then id/class hints, then falls back to <body>.
+    Article-specific ids/classes (article, post, entry, story) are
+    preferred over generic ones (content, body, text).
     """
     tag = soup.find("main")
     if tag:
         return tag
 
-    best = None
-    best_len = 0
+    # Two tiers: article-specific (priority) and generic
+    best_article = None
+    best_article_len = 0
+    best_generic = None
+    best_generic_len = 0
     for candidate in soup.find_all(True):
         cid  = candidate.get("id", "")
         ccls = " ".join(candidate.get("class", []))
-        if _MAIN_ID_RE.search(cid) or _MAIN_CLS_RE.search(ccls):
-            tlen = len(candidate.get_text(strip=True))
-            if tlen > 200 and tlen > best_len:
-                best = candidate
-                best_len = tlen
-    if best is not None:
-        return best
+        is_article = (_ARTICLE_ID_RE.search(cid) or
+                      _ARTICLE_CLS_RE.search(ccls))
+        is_generic = (_MAIN_ID_RE.search(cid) or
+                      _MAIN_CLS_RE.search(ccls))
+        if not is_article and not is_generic:
+            continue
+        tlen = len(candidate.get_text(strip=True))
+        if tlen <= 200:
+            continue
+        if is_article and tlen > best_article_len:
+            best_article = candidate
+            best_article_len = tlen
+        elif not is_article and tlen > best_generic_len:
+            best_generic = candidate
+            best_generic_len = tlen
+
+    # Prefer article-specific match, but only if it covers a substantial
+    # portion of the generic match.  On homepages the generic container
+    # (e.g. div.content) holds the whole page while an article-class element
+    # may be just one small section — in that case prefer the generic one.
+    if best_article is not None:
+        if best_generic is None or best_article_len >= best_generic_len * 0.4:
+            return best_article
+    if best_generic is not None:
+        return best_generic
 
     return soup.find("body") or soup
 
@@ -1437,6 +1463,25 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
     for node in soup.find_all(string=lambda t: isinstance(t, Comment)):
         node.extract()
 
+    # 2a. Remove JS framework template text and loading placeholders.
+    #     Angular/Vue/Mustache templates like {{expr}} are useless without JS.
+    #     Also remove common Arabic/English loading spinners.
+    _TEMPLATE_RE = re.compile(r"\{\{.*?\}\}")
+    _LOADING_RE = re.compile(
+        r"جارٍ تحميل البيانات|Loading\.\.\.|جاري التحميل", re.I)
+    for text_node in soup.find_all(string=True):
+        if isinstance(text_node, Comment):
+            continue
+        s = str(text_node)
+        if _TEMPLATE_RE.search(s):
+            cleaned = _TEMPLATE_RE.sub("", s).strip()
+            if cleaned:
+                text_node.replace_with(cleaned)
+            else:
+                text_node.extract()
+        elif _LOADING_RE.search(s):
+            text_node.extract()
+
     # 2b. Convert inline <svg> elements to base64 <img> tags.
     #     Old browsers can't render SVG at all, but cairosvg can rasterize
     #     them into PNG which we then embed as a data: URI.
@@ -1469,9 +1514,52 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
     for tag in soup.find_all(DROP_TAGS):
         tag.decompose()
 
+    # 3a. Remove elements with classes/ids that indicate non-content
+    #     (share buttons, ad spaces, popups, AI summaries, overlays)
+    _JUNK_CLS_RE = re.compile(
+        r"\b(share-buttons|ad-space|banner\d|popup|overlay-modal|"
+        r"notification-box|cookie|social-share|article-breif|"
+        r"share-loader|comment_container)\b", re.I)
+    for el in list(soup.find_all(True, class_=True)):
+        if el.attrs is None:
+            continue
+        ccls = " ".join(el.get("class", []))
+        if _JUNK_CLS_RE.search(ccls):
+            el.decompose()
+
     # 3b. Unwrap tags that may have swallowed article content
     for tag in soup.find_all(UNWRAP_TAGS):
         tag.unwrap()
+
+    # 3c. Remove custom elements (Vue/Angular/Web Components) whose tag
+    #     names contain a hyphen — these are never valid HTML 3.2 and
+    #     their content is usually JS template placeholders.
+    _HTML_TAGS = frozenset({
+        "a", "abbr", "address", "area", "article", "aside", "b", "base",
+        "bdo", "big", "blockquote", "body", "br", "button", "caption",
+        "center", "cite", "code", "col", "colgroup", "dd", "del", "details",
+        "dfn", "dir", "div", "dl", "dt", "em", "fieldset", "figcaption",
+        "figure", "font", "footer", "form", "h1", "h2", "h3", "h4", "h5",
+        "h6", "head", "header", "hr", "html", "i", "iframe", "img", "input",
+        "ins", "kbd", "label", "legend", "li", "link", "main", "map", "mark",
+        "menu", "meta", "nav", "noscript", "ol", "optgroup", "option", "p",
+        "param", "picture", "pre", "q", "s", "samp", "script", "section",
+        "select", "small", "source", "span", "strike", "strong", "style",
+        "sub", "summary", "sup", "svg", "table", "tbody", "td", "textarea",
+        "tfoot", "th", "thead", "time", "title", "tr", "tt", "u", "ul",
+        "var", "video", "wbr",
+    })
+    for tag in list(soup.find_all(True)):
+        if tag.attrs is None:
+            continue
+        # Drop custom elements (tag name with hyphen or not in HTML spec)
+        if tag.name and tag.name not in _HTML_TAGS:
+            tag.decompose()
+            continue
+        # Drop elements with JS framework attributes (Vue v-bind/v-if/@,
+        # Angular ng-*)
+        if any(k.startswith(("v-", "@", "ng-")) for k in tag.attrs):
+            tag.decompose()
 
     # 4. Replace <picture> with its <img> child
     for pic in soup.find_all("picture"):
@@ -1510,8 +1598,10 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
         header_el = (body.find("header") if body else None) or soup.find(
             lambda t: t.name == "div" and _has_class_hint(
                 t, ("header", "banner", "masthead", "site-header",
-                    "top-bar", "navbar")))
-        nav_el_top = body.find("nav") if body else None
+                    "top-bar", "navbar", "head")))
+        nav_el_top = (body.find("nav") if body else None) or soup.find(
+            lambda t: t.name == "div" and _has_class_hint(
+                t, ("nav", "main-nav", "site-nav", "navigation")))
         _header_zone = header_el or nav_el_top
         if _header_zone and main_el not in [_header_zone] + list(
                 _header_zone.parents):
@@ -1714,6 +1804,10 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
     _replace_unrenderable_text(soup)
 
     # 9. Fix <img> sources — proxy and cap width; drop SVGs (unconvertible)
+    _JUNK_IMG_RE = re.compile(
+        r"(close[_-]?icon|share[_-]?loader|spinner|loading|loader|"
+        r"spacer|pixel|blank|arrow[_-]?icon|search[_-]?loader|"
+        r"tools[_-]?logo)\b", re.I)
     for img in soup.find_all("img"):
         src = _real_img_src(img, page_url)
         alt    = img.get("alt", "")
@@ -1723,9 +1817,14 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
         if not src:
             img.decompose()
             continue
+        # Drop small utility/icon SVGs (close, share, loader, tools logo)
+        src_lower = src.rstrip("/").lower()
+        if src_lower.endswith(".svg") and _JUNK_IMG_RE.search(src_lower):
+            img.decompose()
+            continue
         # SVG images: proxy them through the image converter which will
         # rasterize via cairosvg → JPEG (falls back to 1x1 GIF if it fails)
-        if src.rstrip("/").lower().endswith(".svg"):
+        if src_lower.endswith(".svg"):
             pass  # fall through to normal proxy handling below
         img["src"] = _proxy_img(src, proxy_host)
         if alt:
