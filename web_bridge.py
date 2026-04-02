@@ -1223,6 +1223,24 @@ def _proxy_page(url, proxy_host, cp1256=False):
     prefix = "/p1/" if cp1256 else "/p/"
     return "http://{}{}{}".format(proxy_host, prefix, clean_url)
 
+def _rewrite_frameset(raw_html, page_url, proxy_host):
+    """Rewrite a <frameset> page: proxy all frame src URLs and return
+    the modified HTML directly (no further transformation needed)."""
+    soup = BeautifulSoup(raw_html, "html.parser")
+    title_tag = soup.find("title")
+    title = title_tag.get_text(" ", strip=True) if title_tag else page_url
+    for frame in soup.find_all("frame"):
+        src = frame.get("src", "")
+        if src:
+            frame["src"] = _proxy_page(urljoin(page_url, src), proxy_host)
+    # Also proxy background images in <body> inside <noframes>
+    for body in soup.find_all("body"):
+        bg = body.get("background", "")
+        if bg:
+            body["background"] = _proxy_img(urljoin(page_url, bg), proxy_host)
+    return title, str(soup)
+
+
 def _proxy_img(url, proxy_host):
     return "http://{}/img/{}".format(proxy_host, unquote(url))
 
@@ -1434,15 +1452,19 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
                                     break
             site_header_html = " ".join(hparts)
             if nav_links:
-                site_header_html += '<br><font size="2">{}</font>'.format(
-                    " | ".join(nav_links))
+                nav_cells = ['<td nowrap><font size="2">{}</font></td>'.format(l)
+                             for l in nav_links]
+                site_header_html += (
+                    '<br><table border="0" cellpadding="2" '
+                    'cellspacing="0"><tr>' +
+                    "".join(nav_cells) + '</tr></table>')
             if site_header_html:
                 site_header_html = (
                     '<table width="100%" border="0" cellpadding="4"'
                     ' cellspacing="0" bgcolor="#eeeeee"><tr><td>'
                     + site_header_html +
                     '</td></tr></table><hr size="1" noshade>\n')
-        return title, site_header_html + forum_html, is_rtl, False
+        return title, site_header_html + forum_html, is_rtl, False, None, None
 
     # 1b. Parse CSS layout information BEFORE removing <style> tags
     css_layouts = _parse_css_layouts(soup)
@@ -1458,6 +1480,18 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
     jsonld_fallback = _extract_jsonld_article(soup)
     if not jsonld_fallback:
         jsonld_fallback = _extract_apollo_article(soup)
+
+    # 1e. Preserve <body> background image and bgcolor before processing
+    body_tag = soup.find("body")
+    body_bg_img = None
+    body_bgcolor = None
+    if body_tag:
+        bg = body_tag.get("background", "")
+        if bg:
+            body_bg_img = _proxy_img(urljoin(page_url, bg), proxy_host)
+        bgc = body_tag.get("bgcolor", "")
+        if bgc:
+            body_bgcolor = bgc
 
     # 2. Remove HTML comments
     for node in soup.find_all(string=lambda t: isinstance(t, Comment)):
@@ -1539,7 +1573,7 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
         "bdo", "big", "blockquote", "body", "br", "button", "caption",
         "center", "cite", "code", "col", "colgroup", "dd", "del", "details",
         "dfn", "dir", "div", "dl", "dt", "em", "fieldset", "figcaption",
-        "figure", "font", "footer", "form", "h1", "h2", "h3", "h4", "h5",
+        "figure", "font", "footer", "form", "frame", "frameset", "h1", "h2", "h3", "h4", "h5",
         "h6", "head", "header", "hr", "html", "i", "iframe", "img", "input",
         "ins", "kbd", "label", "legend", "li", "link", "main", "map", "mark",
         "menu", "meta", "nav", "noscript", "ol", "optgroup", "option", "p",
@@ -1699,13 +1733,18 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
                         parts.append(" <b>{}</b>".format(brand_text))
                 site_header_html = " ".join(parts)
                 if nav_links:
-                    nav_parts = []
+                    nav_cells = []
                     for txt, href in nav_links:
                         phref = _proxy_page(href, proxy_host, cp1256)
-                        nav_parts.append(
-                            '<a href="{}">{}</a>'.format(phref, txt))
-                    site_header_html += '<br><font size="2">' + \
-                        " | ".join(nav_parts) + "</font>"
+                        nav_cells.append(
+                            '<td nowrap><font size="2">'
+                            '<a href="{}">{}</a>'
+                            '</font></td>'.format(phref, txt))
+                    site_header_html += (
+                        '<br><table border="0" cellpadding="2" '
+                        'cellspacing="0"><tr>' +
+                        "".join(nav_cells) +
+                        '</tr></table>')
                 site_header_html = (
                     '<table width="100%" border="0" cellpadding="4" '
                     'cellspacing="0" bgcolor="#eeeeee"><tr><td>'
@@ -1739,6 +1778,27 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
             main_el.insert(0, soup.new_tag("hr"))
             main_el.insert(0, form)
             rescued = True
+
+    # 7c. Convert <nav> elements to horizontal single-row tables.
+    #     Nav menus should display horizontally, not as a vertical list.
+    for nav in soup.find_all("nav"):
+        links = nav.find_all("a", href=True)
+        if len(links) >= 2:
+            tbl = soup.new_tag("table", border="0", cellpadding="4",
+                               cellspacing="0")
+            tr = soup.new_tag("tr")
+            tbl.append(tr)
+            for a in links:
+                text = a.get_text(strip=True)
+                if not text or len(text) > 50:
+                    continue
+                td = soup.new_tag("td", nowrap="")
+                a_copy = a.extract()
+                td.append(a_copy)
+                tr.append(td)
+            if tr.find("td"):
+                nav.clear()
+                nav.append(tbl)
 
     # 8. Remap HTML5 semantic tags to HTML 3.2 equivalents
     for old_name, new_name in REMAP_TAGS.items():
@@ -1813,6 +1873,18 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
         alt    = img.get("alt", "")
         width  = img.get("width", "")
         height = img.get("height", "")
+        # URL size hints (e.g. -140x140.webp) represent the intended
+        # display size (thumbnail).  They override tag attributes which
+        # may contain the raw/original image dimensions.
+        url_w = url_h = ""
+        if src:
+            size_m = re.search(r'[-_/](\d{2,4})x(\d{2,4})(?:\.|$)', src)
+            if size_m:
+                url_w, url_h = size_m.group(1), size_m.group(2)
+        if url_w:
+            width = url_w
+        if url_h:
+            height = url_h
         img.attrs = {}
         if not src:
             img.decompose()
@@ -1906,6 +1978,18 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
         for a in bad_attrs:
             del tag[a]
 
+    # 11a. Add visible borders to content tables that lost their CSS styling.
+    #      Tables generated by the bridge for layout already have border="0",
+    #      so only tables WITHOUT a border attribute (original content tables)
+    #      get border="1" for readability.
+    for tbl in soup.find_all("table"):
+        if not tbl.get("border"):
+            tbl["border"] = "1"
+            if not tbl.get("cellpadding"):
+                tbl["cellpadding"] = "2"
+            if not tbl.get("cellspacing"):
+                tbl["cellspacing"] = "1"
+
     # 11b. Replace <div> with HTML 3.2 equivalents.
     #      IE2 does not understand <div> and renders its content inline,
     #      causing everything to flow as one long horizontal line.
@@ -1934,6 +2018,8 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
     # Also replace <span> — IE2 may not understand it either; unwrap cleanly.
     for span in list(soup.find_all("span")):
         span.unwrap()
+
+    # 11c. (moved to post-processing step 15b on rendered HTML)
 
     # 12. Extract title
     title_tag = soup.find("title")
@@ -1976,6 +2062,60 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
     content_html = content_html.replace("<hr/>", "<hr>")
     content_html = re.sub(r"<(img\s[^>]*?)\s*/>", r"<\1>", content_html)
 
+    # 15b. Convert runs of consecutive <a> links separated by <br> into
+    #      horizontal table rows.  Nav menus become vertical after div
+    #      unwrapping — render them side by side in a single-row table.
+    _LINK_RE = re.compile(r'<a\s[^>]*href="[^"]*"[^>]*>.*?</a>', re.S)
+    _BR_RE = re.compile(r'\s*<br/?>\s*', re.S)
+    def _linearize_nav(html):
+        """Find runs of 3+ links separated by <br> and wrap in a table."""
+        result = []
+        pos = 0
+        while pos < len(html):
+            m = _LINK_RE.search(html, pos)
+            if not m:
+                result.append(html[pos:])
+                break
+            # Try to collect a run of links from this point
+            run_start = m.start()
+            links = [m.group(0)]
+            end = m.end()
+            while True:
+                br_m = _BR_RE.match(html, end)
+                if not br_m:
+                    break
+                next_a = _LINK_RE.match(html, br_m.end())
+                if not next_a:
+                    break
+                links.append(next_a.group(0))
+                end = next_a.end()
+            if len(links) >= 5:
+                # Only convert if links look like a nav menu: all short
+                # text, and average length ≤ 20 chars (nav labels are
+                # brief; product titles or listing items are longer).
+                texts = []
+                all_short = True
+                for lnk in links:
+                    txt = re.sub(r'<[^>]+>', '', lnk).strip()
+                    if len(txt) > 40:
+                        all_short = False
+                        break
+                    texts.append(txt)
+                avg_len = sum(len(t) for t in texts) / len(texts) if texts else 99
+                if all_short and avg_len <= 20:
+                    result.append(html[pos:run_start])
+                    cells = ''.join(
+                        '<td nowrap>{}</td>'.format(l) for l in links)
+                    result.append(
+                        '<table border="0" cellpadding="3" '
+                        'cellspacing="0"><tr>{}</tr></table>'.format(cells))
+                    pos = end
+                    continue
+            result.append(html[pos:m.end()])
+            pos = m.end()
+        return ''.join(result)
+    content_html = _linearize_nav(content_html)
+
     # 16. Append a warning if the page required JavaScript to render.
     if js_only:
         content_html += (
@@ -1985,7 +2125,7 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
             '</font></p>'
         )
 
-    return title, content_html, is_rtl, js_only
+    return title, content_html, is_rtl, js_only, body_bg_img, body_bgcolor
 
 
 # ── HTML beautifier (unused) ──────────────────────────────────────────────
@@ -2243,7 +2383,8 @@ def _error_page(title, message):
 # ── Page shell ─────────────────────────────────────────────────────────────
 
 def _page_shell(title, current_url, content_html, proxy_host,
-                is_rtl=False, cp1256=False, client_ip=""):
+                is_rtl=False, cp1256=False, client_ip="",
+                body_bg_img=None, body_bgcolor=None):
     escaped_url = current_url.replace('"', "%22").replace("'", "%27")
     safe_title = (
         title
@@ -2276,7 +2417,7 @@ def _page_shell(title, current_url, content_html, proxy_host,
 <head>
 <title>{title} -- Web Bridge</title>{meta_charset}
 </head>
-<body bgcolor="#ffffff" text="#000000" link="#0000cc" vlink="#551a8b" alink="#ff0000" topmargin="0" marginheight="0"{body_dir}>
+<body bgcolor="{body_bgcolor}" text="#000000" link="#0000cc" vlink="#551a8b" alink="#ff0000" topmargin="0" marginheight="0"{body_bg}{body_dir}>
 
 <table width="100%" border="0" cellpadding="3" cellspacing="0" bgcolor="#c0c0c0" dir="ltr">
 <tr>
@@ -2320,6 +2461,8 @@ def _page_shell(title, current_url, content_html, proxy_host,
 </html>
 """.format(title=safe_title, url=escaped_url, content=content_html,
            html_dir=html_dir, body_dir=body_dir,
+           body_bgcolor=body_bgcolor or "#ffffff",
+           body_bg=' background="{}"'.format(body_bg_img) if body_bg_img else "",
            hist_select=hist_select, cp_checked=cp_checked,
            proxy_host=proxy_host, meta_charset=meta_charset)
 
@@ -2761,13 +2904,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         resp = bot_resp
             except Exception:
                 pass
+        # Detect frameset pages — serve them directly with proxied frame URLs
+        raw_lower = raw[:2000].lower()
+        if b"<frameset" in raw_lower:
+            try:
+                html_str = raw.decode(resp.encoding or "utf-8",
+                                      errors="replace")
+                title, full_html = _rewrite_frameset(
+                    html_str, resp.url, proxy_host)
+                html_bytes = full_html.encode("utf-8", errors="replace")
+                self._send(200, "text/html; charset=utf-8", html_bytes)
+                return
+            except Exception:
+                pass  # fall through to normal transform
+
         try:
-            title, content, is_rtl, js_only = transform_html(
-                raw, resp.url, proxy_host, cp1256
-            )
+            title, content, is_rtl, js_only, bg_img, bg_color = \
+                transform_html(raw, resp.url, proxy_host, cp1256)
             html = _page_shell(title, resp.url, content, proxy_host,
                                is_rtl, cp1256,
-                               client_ip=self.client_address[0])
+                               client_ip=self.client_address[0],
+                               body_bg_img=bg_img,
+                               body_bgcolor=bg_color)
             if cp1256:
                 charset = "windows-1256"
                 html_bytes = html.encode("cp1256", errors="xmlcharrefreplace")
