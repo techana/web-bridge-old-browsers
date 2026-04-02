@@ -218,8 +218,8 @@ _STRIP_RE = re.compile(
 _LAZY_SRC = ("data-src", "data-original", "data-lazy",
              "data-url", "data-lazy-src", "data-echo", "data-hi-res")
 
-_MAIN_ID_RE  = re.compile(r"\b(main|content|article|post|entry|body|text|story)\b", re.I)
-_MAIN_CLS_RE = re.compile(r"\b(main|content|article|post|entry|body|text|story)\b", re.I)
+_MAIN_ID_RE  = re.compile(r"\b(main|content|article|post|entry|body|text|story|product|dp-container|listing)\b", re.I)
+_MAIN_CLS_RE = re.compile(r"\b(main|content|article|post|entry|body|text|story|product|listing)\b", re.I)
 # Patterns that strongly indicate article content (scored higher than generic matches)
 _ARTICLE_ID_RE  = re.compile(r"\b(article|post|entry|story)\b", re.I)
 _ARTICLE_CLS_RE = re.compile(r"\b(article|post|entry|story)\b", re.I)
@@ -1177,7 +1177,10 @@ def _find_main(soup):
     best_article_len = 0
     best_generic = None
     best_generic_len = 0
+    _SKIP_MAIN = frozenset({"script", "style", "head", "title", "noscript"})
     for candidate in soup.find_all(True):
+        if candidate.name in _SKIP_MAIN:
+            continue
         cid  = candidate.get("id", "")
         ccls = " ".join(candidate.get("class", []))
         is_article = (_ARTICLE_ID_RE.search(cid) or
@@ -1906,6 +1909,13 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
         img["src"] = _proxy_img(src, proxy_host)
         if alt:
             img["alt"] = alt
+        # Cap avatar/profile images to 36x36 when no size is specified
+        if not width and not height:
+            _AVATAR_RE = re.compile(
+                r"(avatar|profile[_-]?(?:pic|img|image|photo)|"
+                r"user[_-]?(?:pic|img|image|photo))", re.I)
+            if _AVATAR_RE.search(src_lower) or _AVATAR_RE.search(alt.lower()):
+                width, height = "36", "36"
         if width:
             try:
                 w = int(re.sub(r"[^0-9]", "", str(width)))
