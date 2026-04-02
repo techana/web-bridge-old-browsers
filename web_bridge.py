@@ -1464,7 +1464,7 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
                     ' cellspacing="0" bgcolor="#eeeeee"><tr><td>'
                     + site_header_html +
                     '</td></tr></table><hr size="1" noshade>\n')
-        return title, site_header_html + forum_html, is_rtl, False, None, None
+        return title, site_header_html + forum_html, is_rtl, False, None, None, {}
 
     # 1b. Parse CSS layout information BEFORE removing <style> tags
     css_layouts = _parse_css_layouts(soup)
@@ -1481,10 +1481,11 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
     if not jsonld_fallback:
         jsonld_fallback = _extract_apollo_article(soup)
 
-    # 1e. Preserve <body> background image and bgcolor before processing
+    # 1e. Preserve <body> visual attributes before processing
     body_tag = soup.find("body")
     body_bg_img = None
     body_bgcolor = None
+    body_attrs = {}  # text, link, vlink, alink colors
     if body_tag:
         bg = body_tag.get("background", "")
         if bg:
@@ -1492,6 +1493,10 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
         bgc = body_tag.get("bgcolor", "")
         if bgc:
             body_bgcolor = bgc
+        for attr in ("text", "link", "vlink", "alink"):
+            val = body_tag.get(attr, "")
+            if val:
+                body_attrs[attr] = val
 
     # 2. Remove HTML comments
     for node in soup.find_all(string=lambda t: isinstance(t, Comment)):
@@ -2125,7 +2130,7 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
             '</font></p>'
         )
 
-    return title, content_html, is_rtl, js_only, body_bg_img, body_bgcolor
+    return title, content_html, is_rtl, js_only, body_bg_img, body_bgcolor, body_attrs
 
 
 # ── HTML beautifier (unused) ──────────────────────────────────────────────
@@ -2384,7 +2389,7 @@ def _error_page(title, message):
 
 def _page_shell(title, current_url, content_html, proxy_host,
                 is_rtl=False, cp1256=False, client_ip="",
-                body_bg_img=None, body_bgcolor=None):
+                body_bg_img=None, body_bgcolor=None, body_attrs=None):
     escaped_url = current_url.replace('"', "%22").replace("'", "%27")
     safe_title = (
         title
@@ -2417,7 +2422,7 @@ def _page_shell(title, current_url, content_html, proxy_host,
 <head>
 <title>{title} -- Web Bridge</title>{meta_charset}
 </head>
-<body bgcolor="{body_bgcolor}" text="#000000" link="#0000cc" vlink="#551a8b" alink="#ff0000" topmargin="0" marginheight="0"{body_bg}{body_dir}>
+<body bgcolor="{body_bgcolor}" text="{body_text}" link="{body_link}" vlink="{body_vlink}" alink="{body_alink}" topmargin="0" marginheight="0"{body_bg}{body_dir}>
 
 <table width="100%" border="0" cellpadding="3" cellspacing="0" bgcolor="#c0c0c0" dir="ltr">
 <tr>
@@ -2462,6 +2467,10 @@ def _page_shell(title, current_url, content_html, proxy_host,
 """.format(title=safe_title, url=escaped_url, content=content_html,
            html_dir=html_dir, body_dir=body_dir,
            body_bgcolor=body_bgcolor or "#ffffff",
+           body_text=(body_attrs or {}).get("text", "#000000"),
+           body_link=(body_attrs or {}).get("link", "#0000cc"),
+           body_vlink=(body_attrs or {}).get("vlink", "#551a8b"),
+           body_alink=(body_attrs or {}).get("alink", "#ff0000"),
            body_bg=' background="{}"'.format(body_bg_img) if body_bg_img else "",
            hist_select=hist_select, cp_checked=cp_checked,
            proxy_host=proxy_host, meta_charset=meta_charset)
@@ -2851,15 +2860,46 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     url, headers=_fetch_headers_for(url),
                     timeout=FETCH_TIMEOUT, allow_redirects=True,
                 )
+            # On 401/403, retry with Googlebot UA — many sites block
+            # unknown user agents but serve content to crawlers.
+            if resp.status_code in (401, 403) and not post_data:
+                try:
+                    bot_headers = dict(_fetch_headers_for(url))
+                    bot_headers["User-Agent"] = GOOGLEBOT_UA
+                    bot_resp = _session.get(
+                        url, headers=bot_headers,
+                        timeout=FETCH_TIMEOUT, allow_redirects=True,
+                    )
+                    if bot_resp.status_code == 200:
+                        resp = bot_resp
+                except Exception:
+                    pass
             resp.raise_for_status()
         except RequestException as exc:
-            body = _error_page(
-                "Could not fetch page",
-                "Could not retrieve <b>{}</b><br><br>"
-                "Reason: {}".format(url, exc)
-            )
-            self._send(200, "text/html; charset=utf-8", body)
-            return
+            # If the response contains HTML, try to render it anyway
+            # (some sites return useful content with 4xx/5xx status).
+            if hasattr(exc, 'response') and exc.response is not None:
+                err_ctype = exc.response.headers.get("Content-Type", "")
+                if "text/html" in err_ctype and len(exc.response.content) > 200:
+                    raw = exc.response.content
+                    resp = exc.response
+                    # Fall through to normal HTML processing below
+                else:
+                    body = _error_page(
+                        "Could not fetch page",
+                        "Could not retrieve <b>{}</b><br><br>"
+                        "Reason: {}".format(url, exc)
+                    )
+                    self._send(200, "text/html; charset=utf-8", body)
+                    return
+            else:
+                body = _error_page(
+                    "Could not fetch page",
+                    "Could not retrieve <b>{}</b><br><br>"
+                    "Reason: {}".format(url, exc)
+                )
+                self._send(200, "text/html; charset=utf-8", body)
+                return
 
         ctype = resp.headers.get("Content-Type", "")
         if ctype.startswith("image/"):
@@ -2919,13 +2959,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass  # fall through to normal transform
 
         try:
-            title, content, is_rtl, js_only, bg_img, bg_color = \
+            title, content, is_rtl, js_only, bg_img, bg_color, b_attrs = \
                 transform_html(raw, resp.url, proxy_host, cp1256)
             html = _page_shell(title, resp.url, content, proxy_host,
                                is_rtl, cp1256,
                                client_ip=self.client_address[0],
                                body_bg_img=bg_img,
-                               body_bgcolor=bg_color)
+                               body_bgcolor=bg_color,
+                               body_attrs=b_attrs)
             if cp1256:
                 charset = "windows-1256"
                 html_bytes = html.encode("cp1256", errors="xmlcharrefreplace")
