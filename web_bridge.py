@@ -2932,11 +2932,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                 filename)
             return
 
-        # If the page uses a JS framework (Apollo/Next.js), retry with
-        # Googlebot UA to get server-side rendered content — many sites
-        # return fully rendered HTML to crawlers but a JS shell to browsers.
+        # If the page uses a JS framework (Apollo/Next.js) or is a JS-heavy
+        # SPA with very little visible text, retry with Googlebot UA — many
+        # sites return fully rendered HTML to crawlers but a JS shell to
+        # browsers.
         raw = resp.content
+        _need_bot_retry = False
         if not post_data and (b"__APOLLO_STATE__" in raw or b"__NEXT_DATA__" in raw):
+            _need_bot_retry = True
+        # Detect JS-heavy SPAs: page with almost no visible body text
+        # (covers large SPAs like amazon.com and small WAF challenge pages)
+        if not _need_bot_retry and not post_data and len(raw) > 500:
+            _quick_soup = BeautifulSoup(raw[:200000], "html.parser")
+            _qbody = _quick_soup.find("body")
+            _qtext = _qbody.get_text(strip=True) if _qbody else ""
+            if len(_qtext) < 200 and _quick_soup.find("script"):
+                _need_bot_retry = True
+        if _need_bot_retry:
             try:
                 bot_headers = dict(_fetch_headers_for(url))
                 bot_headers["User-Agent"] = GOOGLEBOT_UA
@@ -2971,7 +2983,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                               b"javascript required")
         _CAPTCHA_HINTS = (b"captcha-delivery.com", b"captcha", b"datadome",
                           b"challenge-platform", b"turnstile",
-                          b"cf-challenge", b"hcaptcha")
+                          b"cf-challenge", b"hcaptcha", b"awswaf",
+                          b"challenge.js")
         raw_lower_check = raw[:10000].lower()
         # For JS hints, search entire page (may be buried deep in SPAs)
         raw_lower_full = raw.lower()
