@@ -2945,26 +2945,55 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         resp = bot_resp
             except Exception:
                 pass
-        # If the page is a tiny JS-only stub (e.g. "enable JS", or very
-        # short with no real content), use headless Chromium to render it.
-        # Skip pages behind CAPTCHA/bot-detection (DataDome, Cloudflare
-        # Turnstile, etc.) — headless browsers can't solve those either.
-        _JS_ONLY_HINTS = (b"enable js", b"enable javascript",
-                          b"javascript is required", b"javascript required",
-                          b"please turn on javascript",
-                          b"you need to enable javascript")
+        # Detect JS-only pages and retry with Googlebot UA.  Many SPA sites
+        # (x.com, etc.) return a JS shell to browsers but serve rendered
+        # HTML to crawlers.  Check for "JavaScript is not available/disabled"
+        # messages or very small body text with lots of <script> tags.
+        _JS_DISABLED_HINTS = (b"javascript is not available",
+                              b"javascript is disabled",
+                              b"javascript is required",
+                              b"please enable javascript",
+                              b"you need to enable javascript",
+                              b"enable js and disable",
+                              b"please turn on javascript")
+        _JS_ONLY_HINTS = _JS_DISABLED_HINTS + (
+                              b"enable js", b"enable javascript",
+                              b"javascript required")
         _CAPTCHA_HINTS = (b"captcha-delivery.com", b"captcha", b"datadome",
                           b"challenge-platform", b"turnstile",
                           b"cf-challenge", b"hcaptcha")
-        raw_lower_check = raw[:5000].lower()
+        raw_lower_check = raw[:10000].lower()
+        # For JS hints, search entire page (may be buried deep in SPAs)
+        raw_lower_full = raw.lower()
         has_captcha = any(h in raw_lower_check for h in _CAPTCHA_HINTS)
+        # Detect JS-disabled pages (any size) and retry with Googlebot
+        if not has_captcha and not post_data:
+            has_js_hint = any(h in raw_lower_full for h in _JS_DISABLED_HINTS)
+            if has_js_hint:
+                try:
+                    bot_headers = dict(_fetch_headers_for(url))
+                    bot_headers["User-Agent"] = GOOGLEBOT_UA
+                    bot_resp = _session.get(
+                        url, headers=bot_headers,
+                        timeout=FETCH_TIMEOUT, allow_redirects=True,
+                    )
+                    if bot_resp.status_code == 200:
+                        bot_raw = bot_resp.content
+                        # Use Googlebot version if it has more content
+                        if len(bot_raw) > 1000:
+                            raw = bot_raw
+                            resp = bot_resp
+                            print("  [Googlebot retry] {} — {} bytes"
+                                  .format(url, len(raw)))
+                except Exception:
+                    pass
+        # Detect tiny JS stubs for headless rendering fallback
         is_js_stub = (
             not has_captcha
             and len(raw) < 2000
-            and any(h in raw_lower_check for h in _JS_ONLY_HINTS)
+            and any(h in raw_lower_full for h in _JS_ONLY_HINTS)
         )
         if not is_js_stub and not has_captcha and len(raw) < 5000:
-            # Also detect pages that are just a JS loader with no content
             from bs4 import BeautifulSoup as _BS
             _quick = _BS(raw, "html.parser")
             _body = _quick.find("body")
