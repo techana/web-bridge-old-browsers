@@ -2883,7 +2883,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if "text/html" in err_ctype and len(exc.response.content) > 200:
                     raw = exc.response.content
                     resp = exc.response
-                    # Fall through to normal HTML processing below
+                    # Fall through — JS stub detection below may upgrade
+                    # this via headless rendering
                 else:
                     body = _error_page(
                         "Could not fetch page",
@@ -2944,6 +2945,71 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         resp = bot_resp
             except Exception:
                 pass
+        # If the page is a tiny JS-only stub (e.g. "enable JS", or very
+        # short with no real content), use headless Chromium to render it.
+        # Skip pages behind CAPTCHA/bot-detection (DataDome, Cloudflare
+        # Turnstile, etc.) — headless browsers can't solve those either.
+        _JS_ONLY_HINTS = (b"enable js", b"enable javascript",
+                          b"javascript is required", b"javascript required",
+                          b"please turn on javascript",
+                          b"you need to enable javascript")
+        _CAPTCHA_HINTS = (b"captcha-delivery.com", b"captcha", b"datadome",
+                          b"challenge-platform", b"turnstile",
+                          b"cf-challenge", b"hcaptcha")
+        raw_lower_check = raw[:5000].lower()
+        has_captcha = any(h in raw_lower_check for h in _CAPTCHA_HINTS)
+        is_js_stub = (
+            not has_captcha
+            and len(raw) < 2000
+            and any(h in raw_lower_check for h in _JS_ONLY_HINTS)
+        )
+        if not is_js_stub and not has_captcha and len(raw) < 5000:
+            # Also detect pages that are just a JS loader with no content
+            from bs4 import BeautifulSoup as _BS
+            _quick = _BS(raw, "html.parser")
+            _body = _quick.find("body")
+            _body_text = _body.get_text(strip=True) if _body else ""
+            if len(_body_text) < 100 and _quick.find("script"):
+                is_js_stub = True
+        if is_js_stub and HAS_SELENIUM and not post_data:
+            try:
+                opts = ChromeOptions()
+                opts.add_argument("--headless=new")
+                opts.add_argument("--no-sandbox")
+                opts.add_argument("--disable-dev-shm-usage")
+                opts.add_argument("--disable-gpu")
+                opts.add_argument("--window-size=1024,768")
+                if HAS_WDM:
+                    service = ChromeService(ChromeDriverManager(
+                        chrome_type=ChromeType.CHROMIUM).install())
+                else:
+                    service = ChromeService()
+                driver = webdriver.Chrome(service=service, options=opts)
+                try:
+                    driver.set_page_load_timeout(FETCH_TIMEOUT + 10)
+                    driver.get(url)
+                    import time
+                    time.sleep(3)
+                    rendered = driver.page_source
+                finally:
+                    driver.quit()
+                if len(rendered) > len(raw) * 2:
+                    raw = rendered.encode("utf-8", errors="replace")
+                    print("  [JS render] {} — got {} bytes via headless"
+                          .format(url, len(raw)))
+            except Exception as exc:
+                print("  [JS render] failed for {}: {}".format(url, exc))
+        if has_captcha:
+            body = _error_page(
+                "Site blocked (CAPTCHA)",
+                "The site <b>{}</b> uses bot detection (CAPTCHA) and "
+                "cannot be accessed through the bridge.<br><br>"
+                "Try visiting the site directly in a modern browser."
+                .format(url)
+            )
+            self._send(200, "text/html; charset=utf-8", body)
+            return
+
         # Detect frameset pages — serve them directly with proxied frame URLs
         raw_lower = raw[:2000].lower()
         if b"<frameset" in raw_lower:
