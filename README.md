@@ -30,6 +30,7 @@ rebuilds the page structure using `<table>` tags and classic HTML attributes
 - **تحويل SVG** -- يحوّل صور SVG المضمّنة والخارجية إلى JPEG عبر cairosvg، مع استخراج الأبعاد من viewBox وقواعد CSS
 - **استخراج أبعاد الصور من CSS** -- يقرأ width و height و max-width من قواعد الأنماط ويطبّقها على الصور
 - **دعم YouTube** -- يستخرج بيانات الفيديو والبحث من JSON المضمّن (YouTube معتمد بالكامل على JavaScript)
+- **دعم صحيفة سبق** -- يستخرج مقالات الصفحة الرئيسية (أبرز الأخبار، اختيارات المحرر، الأكثر تداولاً) وصفحات المقالات من JSON المضمّن (sabq.org تطبيق JavaScript بالكامل)
 - **دعم اللغة العربية والاتجاه من اليمين لليسار** -- يكتشف الصفحات العربية ويضبط `dir="rtl"`
 - **ترميز CP-1256 تلقائي** -- يكتشف المحتوى العربي تلقائياً ويحوّله إلى Windows-1256 على الأنظمة القديمة، حتى لو لم يكن عنوان الموقع عربياً
 - **إصلاح Windows 3.x** -- يفرض ترميز iso-8859-1 لحل مشكلة الصفحات الفارغة في IE5 على Windows 3.11
@@ -64,6 +65,8 @@ rebuilds the page structure using `<table>` tags and classic HTML attributes
   white background, serves via dedicated `/svg/` endpoint (no `data:` URIs)
 - **YouTube support** -- extracts video info, search results, and related
   videos from embedded JSON data (YouTube is 100% JavaScript-rendered)
+- **Sabq.org support** -- extracts homepage articles (hero, editor picks,
+  trending) and article pages from embedded JSON data (sabq.org is a JS SPA)
 - **RTL / Arabic support** -- detects right-to-left pages and sets `dir="rtl"`
 - **Auto CP-1256 encoding** -- automatically detects Arabic content in the
   response and enables Windows-1256 encoding on legacy OS, even when the URL

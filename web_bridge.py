@@ -1333,9 +1333,404 @@ def _proxy_img(url, proxy_host, width=0, height=0):
     return base
 
 
+# ── Sabq.org extractor ─────────────────────────────────────────────────────
+
+def _sabq_extract(raw, page_url, proxy_host, cp1256=False):
+    """Extract content from sabq.org pages using embedded JSON data.
+    Returns (title, html) or None if not a sabq.org URL or extraction fails."""
+    parsed = urlparse(page_url)
+    if parsed.hostname not in ("sabq.org", "www.sabq.org"):
+        return None
+    try:
+        html_str = raw.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+    import re as _re, json as _json
+
+    def _article_url(slug):
+        return _proxy_page("https://sabq.org/article/" + slug,
+                           proxy_host, cp1256)
+
+    def _render_article(art, show_img=True):
+        """Render a single article dict as HTML table row."""
+        p = []
+        title = _esc(art.get("title", ""))
+        slug = art.get("slug", "")
+        excerpt = _esc(art.get("excerpt", ""))
+        cat = _esc(art.get("categoryName", ""))
+        img_url = art.get("thumbnailUrl") or art.get("imageUrl", "")
+        if img_url and not img_url.startswith("http"):
+            img_url = "https://sabq.org" + img_url
+        link = _article_url(slug) if slug else "#"
+        p.append('<table border="0" cellpadding="4" cellspacing="0" '
+                 'width="100%"><tr>')
+        if show_img and img_url:
+            p.append('<td valign="top" width="160">'
+                     '<a href="{lnk}"><img src="{img}" border="0" '
+                     'width="150" alt=""></a></td>'.format(
+                         lnk=link,
+                         img=_proxy_img(img_url, proxy_host, 150, 0)))
+        p.append('<td valign="top">')
+        if cat:
+            p.append('<font color="#c0392b" size="2"><b>{}</b></font>'
+                     '<br>'.format(cat))
+        p.append('<a href="{}"><b>{}</b></a>'.format(link, title))
+        if excerpt:
+            p.append('<br><font size="2">{}</font>'.format(excerpt))
+        views = art.get("views", 0)
+        if views:
+            p.append('<br><font size="1" color="gray">{} '
+                     '\u0645\u0634\u0627\u0647\u062f\u0629</font>'
+                     .format(views))
+        p.append('</td></tr></table>')
+        return "\n".join(p)
+
+    path = parsed.path.rstrip("/")
+
+    # ── Article page ──────────────────────────────────────────────────
+    if path.startswith("/article/"):
+        slug = path[len("/article/"):]
+
+        # Fetch full article from API
+        api_data = None
+        try:
+            _api_url = "https://sabq.org/api/articles/" + slug
+            _api_resp = _session.get(_api_url, timeout=15, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36"})
+            if _api_resp.status_code == 200:
+                api_data = _json.loads(_api_resp.text)
+        except Exception:
+            pass
+
+        # Fallback to JSON-LD if API fails
+        if not api_data:
+            for m in _re.finditer(
+                    r'<script[^>]*type="application/ld\+json"[^>]*>'
+                    r'(.*?)</script>', html_str, _re.DOTALL):
+                try:
+                    d = _json.loads(m.group(1))
+                    if d.get("@type") == "NewsArticle":
+                        api_data = {
+                            "title": d.get("headline", ""),
+                            "excerpt": d.get("description", ""),
+                            "content": "",
+                            "imageUrl": (d.get("image", [""])[0]
+                                         if isinstance(d.get("image"), list)
+                                         else d.get("image", "")),
+                            "category": {"nameAr":
+                                         d.get("articleSection", "")},
+                            "author": d.get("author", {}),
+                            "publishedAt": d.get("datePublished", ""),
+                            "seoMetadata": {"keywords":
+                                            d.get("keywords", [])},
+                        }
+                        break
+                except Exception:
+                    continue
+        if not api_data:
+            return None
+
+        title = api_data.get("title", "")
+        subtitle = api_data.get("subtitle", "")
+        excerpt = api_data.get("excerpt", "")
+        content_html = api_data.get("content", "")
+        img_url = api_data.get("imageUrl", "")
+        cat_obj = api_data.get("category") or {}
+        section = cat_obj.get("nameAr", "") if isinstance(cat_obj, dict) \
+            else ""
+        author_obj = api_data.get("author") or {}
+        author = author_obj.get("name", "") if isinstance(author_obj, dict) \
+            else ""
+        date_pub = (api_data.get("publishedAt") or "")[:10]
+        views = api_data.get("views", 0)
+        seo = api_data.get("seoMetadata") or {}
+        keywords = seo.get("keywords", []) if isinstance(seo, dict) else []
+
+        parts = []
+        # Logo bar with back link
+        _logo_url = "https://sabq.org/assets/sabq-logo-D1EnGNyQ.png"
+        parts.append('<table border="0" cellpadding="6" cellspacing="0" '
+                     'width="100%" bgcolor="#0f172a"><tr>')
+        parts.append('<td><a href="{}">'
+                     '<img src="{}" border="0" width="100" alt="'
+                     '\u0633\u0628\u0642"></a></td>'.format(
+                         _proxy_page("https://sabq.org/", proxy_host,
+                                     cp1256),
+                         _proxy_img(_logo_url, proxy_host, 100, 0)))
+        parts.append('<td align="left" valign="middle">'
+                     '<a href="{}"><font color="white">'
+                     '\u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629'
+                     '</font></a></td>'.format(
+                         _proxy_page("https://sabq.org/", proxy_host,
+                                     cp1256)))
+        parts.append('</tr></table>')
+
+        # Title + metadata header
+        parts.append('<table border="0" cellpadding="6" cellspacing="0" '
+                     'width="100%" bgcolor="#f5f5f5"><tr><td>')
+        parts.append('<font size="5"><b>{}</b></font>'.format(_esc(title)))
+        if subtitle:
+            parts.append('<br><font size="3" color="#555">{}</font>'
+                         .format(_esc(subtitle)))
+        meta = []
+        if section:
+            meta.append('<font color="#c0392b"><b>{}</b></font>'
+                        .format(_esc(section)))
+        if author:
+            meta.append(_esc(author))
+        if date_pub:
+            meta.append(date_pub)
+        if views:
+            meta.append('{} \u0645\u0634\u0627\u0647\u062f\u0629'
+                        .format(views))
+        if meta:
+            parts.append('<br><font size="2">{}</font>'
+                         .format(" &middot; ".join(meta)))
+        parts.append('</td></tr></table>')
+
+        # Main image
+        if img_url:
+            if not img_url.startswith("http"):
+                img_url = "https://sabq.org" + img_url
+            parts.append('<p><img src="{}" border="0" width="600" '
+                         'alt=""></p>'.format(
+                             _proxy_img(img_url, proxy_host, 600, 0)))
+
+        # Full article content from API
+        if content_html:
+            from bs4 import BeautifulSoup as _BS
+            _csoup = _BS(content_html, "html.parser")
+            # Process images first (before stripping attrs)
+            for _img in _csoup.find_all("img"):
+                _src = _img.get("src", "")
+                if _src:
+                    _img.attrs = {
+                        "src": _proxy_img(_src, proxy_host, 580, 0),
+                        "border": "0", "width": "580", "alt": ""
+                    }
+                else:
+                    _img.decompose()
+            # Strip style/class from all remaining elements
+            for _p in _csoup.find_all(True):
+                if _p.name == "img":
+                    continue  # already handled
+                for _attr in list(_p.attrs.keys()):
+                    if _attr in ("style", "class"):
+                        del _p.attrs[_attr]
+            # Proxy links in article body
+            for _a in _csoup.find_all("a", href=True):
+                _href = _a["href"]
+                if _href.startswith("/"):
+                    _href = "https://sabq.org" + _href
+                if _href.startswith(("http://", "https://")):
+                    _a["href"] = _proxy_page(_href, proxy_host, cp1256)
+            # Convert blockquotes (embedded tweets etc.) to indented text
+            for _bq in _csoup.find_all("blockquote"):
+                _text = _bq.get_text(" ", strip=True)
+                if _text:
+                    _bq.replace_with(_BS(
+                        '<table border="0" cellpadding="8" '
+                        'cellspacing="0" bgcolor="#f0f0f0" width="90%">'
+                        '<tr><td><font size="2">{}</font></td></tr>'
+                        '</table>'.format(_esc(_text)), "html.parser"))
+                else:
+                    _bq.decompose()
+            # Remove div wrappers (unsupported in IE2)
+            for _div in _csoup.find_all("div"):
+                _div.unwrap()
+            # Remove span wrappers (unsupported in IE2)
+            for _span in _csoup.find_all("span"):
+                _span.unwrap()
+            body_html = str(_csoup)
+            if body_html.strip():
+                parts.append(body_html)
+        elif excerpt:
+            # Fallback to excerpt if no content
+            parts.append('<p><font size="3">{}</font></p>'.format(
+                _esc(excerpt)))
+
+        if keywords:
+            parts.append('<p><font size="2"><b>'
+                         '\u0643\u0644\u0645\u0627\u062a '
+                         '\u0645\u0641\u062a\u0627\u062d\u064a\u0629'
+                         ':</b> {}</font></p>'.format(
+                             " &middot; ".join(_esc(k) for k in keywords)))
+
+        parts.append('<hr><p><a href="{}"><b>&larr; '
+                     '\u0627\u0644\u0631\u0626\u064a\u0633\u064a\u0629'
+                     '</b></a></p>'.format(
+                         _proxy_page("https://sabq.org/", proxy_host,
+                                     cp1256)))
+        return _esc(title), "\n".join(parts)
+
+    # ── Homepage ──────────────────────────────────────────────────────
+    m = _re.search(r'window\.__HOMEPAGE_DATA__\s*=\s*({.*?});?\s*</script>',
+                   html_str, _re.DOTALL)
+    if not m:
+        return None
+    try:
+        data = _json.loads(m.group(1))
+    except Exception:
+        return None
+
+    parts = []
+    title = "\u0635\u062d\u064a\u0641\u0629 \u0633\u0628\u0642"  # صحيفة سبق
+
+    # ── Logo + category nav bar ───────────────────────────────────────
+    _logo_url = "https://sabq.org/assets/sabq-logo-D1EnGNyQ.png"
+    parts.append('<table border="0" cellpadding="6" cellspacing="0" '
+                 'width="100%" bgcolor="#0f172a"><tr>')
+    parts.append('<td width="120"><a href="{}">'
+                 '<img src="{}" border="0" width="100" alt="'
+                 '\u0633\u0628\u0642"></a></td>'.format(
+                     _proxy_page("https://sabq.org/", proxy_host, cp1256),
+                     _proxy_img(_logo_url, proxy_host, 100, 0)))
+    # Collect unique categories from articles
+    _seen_cats = {}
+    for _sec in ("hero", "forYou", "editorPicks", "breaking", "deepDive"):
+        for _art in data.get(_sec, []):
+            _cn = _art.get("categoryName", "")
+            _cat = _art.get("category") or {}
+            if _cn and _cn not in _seen_cats:
+                _seen_cats[_cn] = _cat.get("color", "")
+    parts.append('<td valign="middle">')
+    _cat_links = []
+    for _cn in _seen_cats:
+        _cat_links.append(
+            '<a href="{}"><font color="white"><b>{}</b></font></a>'
+            .format(_proxy_page("https://sabq.org/" + _cn,
+                                proxy_host, cp1256), _esc(_cn)))
+    parts.append(' &nbsp;&middot;&nbsp; '.join(_cat_links))
+    parts.append('</td></tr></table>')
+
+    # ── News ticker from <nav> ────────────────────────────────────────
+    from bs4 import BeautifulSoup as _BS
+    _soup = _BS(html_str, "html.parser")
+    _nav = _soup.find("nav")
+    if _nav:
+        _ticker_links = []
+        for _a in _nav.find_all("a", href=True):
+            _href = _a.get("href", "")
+            _txt = _a.get_text(strip=True)
+            if _href.startswith("/article/") and _txt:
+                _full = "https://sabq.org" + _href
+                _ticker_links.append(
+                    '<a href="{}"><font size="2">{}</font></a>'
+                    .format(_proxy_page(_full, proxy_host, cp1256),
+                            _esc(_txt)))
+        if _ticker_links:
+            parts.append(
+                '<table border="0" cellpadding="4" cellspacing="0" '
+                'width="100%" bgcolor="#fee2e2"><tr><td>'
+                '<font size="2" color="#c0392b"><b>'
+                '\u0622\u062e\u0631 \u0627\u0644\u0623\u062e\u0628\u0627'
+                '\u0631</b></font> &nbsp; '
+                + ' &nbsp;| '.join(_ticker_links[:10])
+                + '</td></tr></table>')
+
+    # Hero section
+    hero = data.get("hero", [])
+    if hero:
+        parts.append('<table border="0" cellpadding="6" cellspacing="0" '
+                     'width="100%" bgcolor="#1a1a2e"><tr><td>')
+        parts.append('<font size="4" color="white"><b>'
+                     '\u0623\u0628\u0631\u0632 '
+                     '\u0627\u0644\u0623\u062e\u0628\u0627\u0631'
+                     '</b></font>')
+        parts.append('</td></tr></table>')
+        for art in hero:
+            parts.append(_render_article(art, show_img=True))
+            parts.append('<hr size="1">')
+
+    # For You section
+    for_you = data.get("forYou", [])
+    if for_you:
+        parts.append('<table border="0" cellpadding="6" cellspacing="0" '
+                     'width="100%" bgcolor="#2c3e50"><tr><td>')
+        parts.append('<font size="4" color="white"><b>'
+                     '\u0645\u062e\u062a\u0627\u0631 \u0644\u0643'
+                     '</b></font>')
+        parts.append('</td></tr></table>')
+        for art in for_you:
+            parts.append(_render_article(art, show_img=True))
+            parts.append('<hr size="1">')
+
+    # Editor Picks
+    picks = data.get("editorPicks", [])
+    if picks:
+        parts.append('<table border="0" cellpadding="6" cellspacing="0" '
+                     'width="100%" bgcolor="#8e44ad"><tr><td>')
+        parts.append('<font size="4" color="white"><b>'
+                     '\u0627\u062e\u062a\u064a\u0627\u0631\u0627\u062a '
+                     '\u0627\u0644\u0645\u062d\u0631\u0631'
+                     '</b></font>')
+        parts.append('</td></tr></table>')
+        for art in picks:
+            parts.append(_render_article(art, show_img=True))
+            parts.append('<hr size="1">')
+
+    # Breaking news
+    breaking = data.get("breaking", [])
+    if breaking:
+        parts.append('<table border="0" cellpadding="6" cellspacing="0" '
+                     'width="100%" bgcolor="#c0392b"><tr><td>')
+        parts.append('<font size="4" color="white"><b>'
+                     '\u0639\u0627\u062c\u0644'
+                     '</b></font>')
+        parts.append('</td></tr></table>')
+        for art in breaking:
+            parts.append(_render_article(art, show_img=False))
+            parts.append('<hr size="1">')
+
+    # Deep Dive
+    deep = data.get("deepDive", [])
+    if deep:
+        parts.append('<table border="0" cellpadding="6" cellspacing="0" '
+                     'width="100%" bgcolor="#27ae60"><tr><td>')
+        parts.append('<font size="4" color="white"><b>'
+                     '\u062a\u0639\u0645\u0642'
+                     '</b></font>')
+        parts.append('</td></tr></table>')
+        for art in deep:
+            parts.append(_render_article(art, show_img=True))
+            parts.append('<hr size="1">')
+
+    # Trending topics
+    trending = data.get("trending", [])
+    if trending:
+        parts.append('<table border="0" cellpadding="6" cellspacing="0" '
+                     'width="100%" bgcolor="#e67e22"><tr><td>')
+        parts.append('<font size="4" color="white"><b>'
+                     '\u0627\u0644\u0623\u0643\u062b\u0631 '
+                     '\u062a\u062f\u0627\u0648\u0644\u0627\u064b'
+                     '</b></font>')
+        parts.append('</td></tr></table>')
+        parts.append('<table border="0" cellpadding="4" cellspacing="0" '
+                     'width="100%">')
+        for t in trending:
+            topic = _esc(t.get("topic", ""))
+            views = t.get("views", 0)
+            articles = t.get("articles", 0)
+            parts.append('<tr><td><b>{}</b></td>'
+                         '<td align="left"><font size="2">{} '
+                         '\u0645\u0642\u0627\u0644</font></td>'
+                         '<td align="left"><font size="2">{} '
+                         '\u0645\u0634\u0627\u0647\u062f\u0629'
+                         '</font></td></tr>'.format(
+                             topic, articles, views))
+        parts.append('</table>')
+
+    if not parts:
+        return None
+
+    return title, "\n".join(parts)
+
+
 # ── YouTube extractor ──────────────────────────────────────────────────────
 
-def _youtube_extract(raw, page_url, proxy_host):
+def _youtube_extract(raw, page_url, proxy_host, cp1256=False):
     """Extract content from YouTube pages using embedded JSON data.
     Returns (title, html) or None if not a YouTube URL or extraction fails."""
     parsed = urlparse(page_url)
@@ -1371,6 +1766,79 @@ def _youtube_extract(raw, page_url, proxy_host):
     path = parsed.path
     query = dict(urllib.parse.parse_qsl(parsed.query))
     parts = []
+
+    def _extract_vr(vr, shelf_title=""):
+        """Extract video info from a videoRenderer dict."""
+        vt = vr.get("title", {}).get("runs", [{}])[0].get("text", "")
+        vid = vr.get("videoId", "")
+        ch = vr.get("ownerText", vr.get("shortBylineText", {})).get(
+            "runs", [{}])[0].get("text", "")
+        vv = vr.get("viewCountText", {}).get(
+            "simpleText", vr.get("shortViewCountText", {}).get(
+                "simpleText", ""))
+        th = ""
+        thumbs = vr.get("thumbnail", {}).get("thumbnails", [])
+        if thumbs:
+            th = thumbs[-1].get("url", "")
+        return (shelf_title, vt, vid, ch, vv, th)
+
+    def _extract_gvr(gvr, shelf_title=""):
+        """Extract video info from a gridVideoRenderer dict."""
+        vt = gvr.get("title", {}).get("runs", [{}])[0].get(
+            "text", gvr.get("title", {}).get("simpleText", ""))
+        vid = gvr.get("videoId", "")
+        ch = gvr.get("shortBylineText", {}).get(
+            "runs", [{}])[0].get("text", "")
+        vv = gvr.get("viewCountText", {}).get(
+            "simpleText", gvr.get("shortViewCountText", {}).get(
+                "simpleText", ""))
+        th = ""
+        thumbs = gvr.get("thumbnail", {}).get("thumbnails", [])
+        if thumbs:
+            th = thumbs[-1].get("url", "")
+        return (shelf_title, vt, vid, ch, vv, th)
+
+    # ── YouTube nav bar (logo + search + category links) ──────────────
+    _yt_logo = "https://www.youtube.com/img/desktop/yt_1200.png"
+    _yt_cp_field = ('<input type="hidden" name="cp1256" value="1">'
+                    if cp1256 else '')
+    _yt_cats = [
+        ("\u0631\u0627\u0626\u062c", "/feed/trending"),      # رائج
+        ("\u0645\u0648\u0633\u064a\u0642\u0649", "/feed/music"),  # موسيقى
+        ("\u0623\u0644\u0639\u0627\u0628", "/gaming"),        # ألعاب
+        ("\u0623\u062e\u0628\u0627\u0631", "/feed/news"),     # أخبار
+        ("\u0631\u064a\u0627\u0636\u0629", "/feed/sports"),   # رياضة
+    ]
+    _yt_nav = ('<table border="0" cellpadding="4" cellspacing="0" '
+               'width="100%" bgcolor="#ff0000"><tr>'
+               '<td width="100"><a href="{home}">'
+               '<img src="{logo}" border="0" width="90" alt="YouTube">'
+               '</a></td>'
+               '<td valign="middle">'
+               '<form action="http://{host}/get" method="GET" '
+               'style="margin:0;">'
+               '<input type="hidden" name="url" '
+               'value="https://www.youtube.com/results">{cp}'
+               '<input type="text" name="search_query" size="30">'
+               ' <input type="submit" value="Search">'
+               '</form></td>'
+               '<td align="left" valign="middle" nowrap>').format(
+                   home=_proxy_page("https://www.youtube.com/",
+                                    proxy_host, cp1256),
+                   logo=_proxy_img(_yt_logo, proxy_host, 90, 0),
+                   host=proxy_host,
+                   cp=_yt_cp_field)
+    _cat_parts = []
+    for _cname, _cpath in _yt_cats:
+        _cat_parts.append(
+            '<a href="{}"><font color="white" size="2">'
+            '<b>{}</b></font></a>'.format(
+                _proxy_page("https://www.youtube.com" + _cpath,
+                            proxy_host, cp1256),
+                _cname))
+    _yt_nav += ' &nbsp; '.join(_cat_parts)
+    _yt_nav += '</td></tr></table>'
+    parts.append(_yt_nav)
 
     # ── Video page (/watch?v=...) ──
     if path == "/watch" and "v" in query and player_data:
@@ -1437,13 +1905,94 @@ def _youtube_extract(raw, page_url, proxy_host):
                 for r_title, r_vid, r_ch, r_v, r_l in related:
                     link = _proxy_page(
                         "https://www.youtube.com/watch?v=" + r_vid,
-                        proxy_host)
+                        proxy_host, cp1256)
                     parts.append(
                         '<tr><td><a href="{}">{}</a></td>'
                         '<td>{}</td><td>{}</td><td>{}</td></tr>'
                         .format(link, _esc(r_title), _esc(r_ch),
                                 _esc(r_v), _esc(r_l)))
                 parts.append('</table>')
+
+        return title, "\n".join(parts)
+
+    # ── Playlist page (/playlist?list=...) ──
+    if path == "/playlist" and "list" in query and initial_data:
+        pl_header = initial_data.get("header", {}).get(
+            "playlistHeaderRenderer", {})
+        pl_title = pl_header.get("title", {}).get("simpleText", "Playlist")
+        pl_desc = ""
+        _desc_obj = pl_header.get("descriptionText", {})
+        if isinstance(_desc_obj, dict):
+            pl_desc = _desc_obj.get("simpleText", "")
+        pl_count = pl_header.get("numVideosText", {}).get(
+            "runs", [{}])[0].get("text", "")
+        title = pl_title
+
+        parts.append('<h2>{}</h2>'.format(_esc(pl_title)))
+        _meta_parts = []
+        if pl_count:
+            _meta_parts.append(pl_count)
+        if _meta_parts:
+            parts.append('<p><font size="2">{}</font></p>'.format(
+                " &middot; ".join(_meta_parts)))
+        if pl_desc:
+            parts.append('<p>{}</p>'.format(_esc(pl_desc)))
+
+        # Extract playlist videos
+        try:
+            tabs = initial_data["contents"][
+                "twoColumnBrowseResultsRenderer"]["tabs"]
+            for _tab in tabs:
+                _slr = _tab.get("tabRenderer", {}).get(
+                    "content", {}).get("sectionListRenderer", {})
+                for _sec in _slr.get("contents", []):
+                    _isr = _sec.get("itemSectionRenderer", {})
+                    for _c in _isr.get("contents", []):
+                        _plvlr = _c.get("playlistVideoListRenderer", {})
+                        for _vi in _plvlr.get("contents", []):
+                            _pvr = _vi.get("playlistVideoRenderer", {})
+                            if not _pvr:
+                                continue
+                            _vt = _pvr.get("title", {}).get(
+                                "runs", [{}])[0].get("text", "")
+                            _vid = _pvr.get("videoId", "")
+                            _vch = _pvr.get("shortBylineText", {}).get(
+                                "runs", [{}])[0].get("text", "")
+                            _vl = _pvr.get("lengthText", {}).get(
+                                "simpleText", "")
+                            _vth = ""
+                            _thumbs = _pvr.get("thumbnail", {}).get(
+                                "thumbnails", [])
+                            if _thumbs:
+                                _vth = _thumbs[-1].get("url", "")
+                            if _vt and _vid:
+                                _link = _proxy_page(
+                                    "https://www.youtube.com/watch?v="
+                                    + _vid, proxy_host, cp1256)
+                                parts.append(
+                                    '<table border="0" cellpadding="2">'
+                                    '<tr><td valign="top">')
+                                if _vth:
+                                    parts.append(
+                                        '<a href="{}"><img src="{}" '
+                                        'width="120"></a>'.format(
+                                            _link,
+                                            _proxy_img(_vth, proxy_host)))
+                                parts.append(
+                                    '</td><td valign="top">'
+                                    '<b><a href="{}">{}</a></b>'.format(
+                                        _link, _esc(_vt)))
+                                if _vch:
+                                    parts.append(
+                                        '<br><font size="2">{}</font>'
+                                        .format(_esc(_vch)))
+                                if _vl:
+                                    parts.append(
+                                        '<br><font size="2">{}</font>'
+                                        .format(_esc(_vl)))
+                                parts.append('</td></tr></table>')
+        except (KeyError, IndexError):
+            pass
 
         return title, "\n".join(parts)
 
@@ -1492,7 +2041,8 @@ def _youtube_extract(raw, page_url, proxy_host):
             parts.append('<h2>Search: {}</h2>'.format(_esc(sq)))
             for v_title, v_id, v_ch, v_v, v_l, v_d, v_th in results[:20]:
                 link = _proxy_page(
-                    "https://www.youtube.com/watch?v=" + v_id, proxy_host)
+                    "https://www.youtube.com/watch?v=" + v_id, proxy_host,
+                    cp1256)
                 parts.append('<table border="0" cellpadding="2">'
                              '<tr><td valign="top">')
                 if v_th:
@@ -1516,39 +2066,137 @@ def _youtube_extract(raw, page_url, proxy_host):
                 parts.append('</td></tr></table><br>')
             return title, "\n".join(parts)
 
-    # ── Homepage or other page — show search form + category links ──
+    # ── Homepage, category, or other browse page ──
     title = "YouTube"
-    parts.append('<h2>YouTube</h2>')
-    parts.append(
-        '<form action="http://{}/get" method="GET">'
-        '<input type="hidden" name="url" '
-        'value="https://www.youtube.com/results">'
-        '<b>Search YouTube:</b> '
-        '<input type="text" name="search_query" size="40"> '
-        '<input type="submit" value="Search">'
-        '</form><br>'.format(proxy_host))
 
-    # Try to extract guide/sidebar categories
+    # Try to extract videos from browse pages (trending, music, gaming…)
+    _browse_videos = []  # list of (shelf_title, title, videoId, channel,
+                         #          views, thumb_url)
     if initial_data:
         try:
-            guide_items = initial_data.get("header", {}).get(
-                "feedTabbedHeaderRenderer", {}).get("tabs", [])
-            if not guide_items:
-                guide_items = []
-            for gi in guide_items:
-                tab = gi.get("feedTabbedHeaderRenderer", {})
-                endpoint = tab.get("endpoint", {})
+            tabs = initial_data.get("contents", {}).get(
+                "twoColumnBrowseResultsRenderer", {}).get("tabs", [])
+            for _tab in tabs:
+                _tc = _tab.get("tabRenderer", {}).get("content", {})
+                # richGridRenderer (music, trending)
+                _rgr = _tc.get("richGridRenderer", {})
+                for _ri in _rgr.get("contents", []):
+                    _rsr = _ri.get("richSectionRenderer", {})
+                    _rshelf = _rsr.get("content", {}).get(
+                        "richShelfRenderer", {})
+                    if _rshelf:
+                        _st = _rshelf.get("title", {}).get(
+                            "runs", [{}])[0].get("text", "")
+                        for _sc in _rshelf.get("contents", []):
+                            _vc = _sc.get("richItemRenderer", {}).get(
+                                "content", {})
+                            _vr = _vc.get("videoRenderer", {})
+                            if _vr:
+                                _browse_videos.append(_extract_vr(
+                                    _vr, _st))
+                            # lockupViewModel (music playlists)
+                            _lvm = _vc.get("lockupViewModel", {})
+                            if _lvm:
+                                _meta = _lvm.get("metadata", {}).get(
+                                    "lockupMetadataViewModel", {})
+                                _lt = _meta.get("title", {}).get(
+                                    "content", "")
+                                _lid = _lvm.get("contentId", "")
+                                _lth = ""
+                                _ci = _lvm.get("contentImage", {})
+                                _pt = _ci.get(
+                                    "collectionThumbnailViewModel",
+                                    _ci.get("thumbnailViewModel", {}))
+                                if _pt:
+                                    _tvm = _pt.get(
+                                        "primaryThumbnail",
+                                        _pt).get(
+                                        "thumbnailViewModel",
+                                        _pt).get("image", {})
+                                    _srcs = _tvm.get("sources", [])
+                                    if _srcs:
+                                        _lth = _srcs[0].get("url", "")
+                                if _lt and _lid:
+                                    _browse_videos.append(
+                                        (_st, _lt, _lid, "", "", _lth,
+                                         True))
+                # sectionListRenderer (gaming)
+                _slr = _tc.get("sectionListRenderer", {})
+                for _si in _slr.get("contents", []):
+                    _isr = _si.get("itemSectionRenderer", {})
+                    for _c in _isr.get("contents", []):
+                        _sr = _c.get("shelfRenderer", {})
+                        if _sr:
+                            _st = _sr.get("title", {}).get(
+                                "runs", [{}])[0].get(
+                                "text", _sr.get("title", {}).get(
+                                    "simpleText", ""))
+                            _hlr = _sr.get("content", {}).get(
+                                "horizontalListRenderer", {})
+                            for _vi in _hlr.get("items", []):
+                                _gvr = _vi.get("gridVideoRenderer", {})
+                                if _gvr:
+                                    _browse_videos.append(
+                                        _extract_gvr(_gvr, _st))
+                        _hcl = _c.get("horizontalCardListRenderer", {})
+                        if _hcl:
+                            for _card in _hcl.get("cards", []):
+                                _gvr = _card.get(
+                                    "gridVideoRenderer", {})
+                                if _gvr:
+                                    _browse_videos.append(
+                                        _extract_gvr(_gvr, ""))
         except Exception:
             pass
 
-    parts.append('<p><b>Try searching for a video above, or browse '
-                 'a channel directly.</b></p>')
-    parts.append('<p>Example: '
-                 '<a href="{}">youtube.com/results?search_query=retro+computing'
-                 '</a></p>'.format(
-                     _proxy_page(
-                         "https://www.youtube.com/results?"
-                         "search_query=retro+computing", proxy_host)))
+    if _browse_videos:
+        # Group by shelf title
+        _current_shelf = None
+        for _bv in _browse_videos:
+            _is_playlist = len(_bv) > 6 and _bv[6]
+            _st, _vt, _vid, _vch, _vv, _vth = _bv[:6]
+            if _st and _st != _current_shelf:
+                if _current_shelf is not None:
+                    parts.append('<br>')
+                parts.append(
+                    '<table border="0" cellpadding="4" cellspacing="0" '
+                    'width="100%" bgcolor="#e0e0e0"><tr><td>'
+                    '<b>{}</b></td></tr></table>'.format(_esc(_st)))
+                _current_shelf = _st
+            if _is_playlist:
+                _link = _proxy_page(
+                    "https://www.youtube.com/playlist?list=" + _vid,
+                    proxy_host, cp1256)
+            else:
+                _link = _proxy_page(
+                    "https://www.youtube.com/watch?v=" + _vid,
+                    proxy_host, cp1256)
+            parts.append('<table border="0" cellpadding="2"><tr>'
+                         '<td valign="top">')
+            if _vth:
+                parts.append(
+                    '<a href="{}"><img src="{}" width="120"></a>'
+                    .format(_link, _proxy_img(_vth, proxy_host)))
+            parts.append('</td><td valign="top">')
+            parts.append('<b><a href="{}">{}</a></b>'.format(
+                _link, _esc(_vt)))
+            if _vch:
+                parts.append('<br><font size="2">{}</font>'.format(
+                    _esc(_vch)))
+            if _vv:
+                parts.append('<br><font size="2">{}</font>'.format(
+                    _esc(_vv)))
+            parts.append('</td></tr></table>')
+    else:
+        parts.append('<p><b>Try searching for a video above, or browse '
+                     'a channel directly.</b></p>')
+        parts.append('<p>Example: '
+                     '<a href="{}">youtube.com/results?search_query='
+                     'retro+computing</a></p>'.format(
+                         _proxy_page(
+                             "https://www.youtube.com/results?"
+                             "search_query=retro+computing", proxy_host,
+                             cp1256)))
 
     return title, "\n".join(parts)
 
@@ -1842,11 +2490,41 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
     for svg_tag in soup.find_all("svg"):
         try:
             import cairosvg as _cairosvg
+            # Inject default styles for Highcharts SVGs — cairosvg
+            # doesn't know about the CSS classes Highcharts uses for
+            # colors, so charts render as black blobs without this.
+            if svg_tag.find(class_=re.compile(r"highcharts")):
+                _hc_style = svg_tag.find("style") or \
+                    soup.new_tag("style")
+                _hc_css = (
+                    ".highcharts-background{fill:#fff}"
+                    ".highcharts-color-0 .highcharts-area{fill:#7cb5ec;"
+                    "fill-opacity:0.75}"
+                    ".highcharts-color-0 .highcharts-graph{stroke:#7cb5ec;"
+                    "stroke-width:2;fill:none}"
+                    ".highcharts-color-1 .highcharts-area{fill:#90ed7d;"
+                    "fill-opacity:0.75}"
+                    ".highcharts-color-1 .highcharts-graph{stroke:#90ed7d;"
+                    "stroke-width:2;fill:none}"
+                    ".highcharts-axis-line{stroke:#ccd6eb;stroke-width:1}"
+                    ".highcharts-grid-line{stroke:#e6e6e6;stroke-width:1}"
+                    ".highcharts-tick{stroke:#ccd6eb;stroke-width:1}"
+                    ".highcharts-axis-labels text{fill:#666;font-size:11px}"
+                    ".highcharts-tracker-line{stroke-width:0;fill:none}"
+                    ".highcharts-halo{fill:none}"
+                )
+                if not _hc_style.parent:
+                    _hc_style.string = _hc_css
+                    svg_tag.insert(0, _hc_style)
+                else:
+                    _hc_style.string = (_hc_style.string or "") + _hc_css
             svg_bytes = str(svg_tag).encode("utf-8")
             # Determine a reasonable render width from attributes:
             # try width attr, then viewBox, then height attr.
             render_w = 0
             render_h = 0
+            _vb_w = 0   # viewBox native dimensions
+            _vb_h = 0
             for dim_attr, target in [("width", "w"), ("height", "h")]:
                 val = svg_tag.get(dim_attr, "")
                 try:
@@ -1857,20 +2535,39 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
                         render_h = n
                 except (ValueError, TypeError):
                     pass
-            # Try viewBox="0 0 W H" for size hints
+            # Also check inline style for width/height (e.g. "width:16px")
+            _svg_style = svg_tag.get("style", "")
             if not render_w:
-                vb = svg_tag.get("viewbox", svg_tag.get("viewBox", ""))
-                vb_parts = str(vb).split()
-                if len(vb_parts) == 4:
-                    try:
-                        render_w = int(float(vb_parts[2]))
-                        if not render_h:
-                            render_h = int(float(vb_parts[3]))
-                    except (ValueError, TypeError):
-                        pass
+                _sw = re.search(r'width\s*:\s*(\d+)', _svg_style)
+                if _sw:
+                    render_w = int(_sw.group(1))
+            if not render_h:
+                _sh = re.search(r'height\s*:\s*(\d+)', _svg_style)
+                if _sh:
+                    render_h = int(_sh.group(1))
+            # Try viewBox="0 0 W H" for size hints
+            vb = svg_tag.get("viewbox", svg_tag.get("viewBox", ""))
+            vb_parts = str(vb).split()
+            if len(vb_parts) == 4:
+                try:
+                    _vb_w = int(float(vb_parts[2]))
+                    _vb_h = int(float(vb_parts[3]))
+                except (ValueError, TypeError):
+                    pass
+            if not render_w and _vb_w:
+                render_w = _vb_w
+            if not render_h and _vb_h:
+                render_h = _vb_h
             # Default to 200 only if we truly have no size info
             if not render_w:
                 render_w = render_h if render_h else 200
+            # Cap small icon SVGs: if viewBox is tiny (≤48px, typical
+            # for icons/stars) and no explicit large width was set,
+            # render at native size — don't inflate to 200.
+            _is_icon = (_vb_w and _vb_w <= 48 and _vb_h and _vb_h <= 48)
+            if _is_icon and render_w > _vb_w * 2:
+                render_w = _vb_w
+                render_h = _vb_h
             render_w = min(render_w, MAX_IMG_W)
             png_data = _cairosvg.svg2png(bytestring=svg_bytes,
                                          output_width=render_w)
@@ -1879,6 +2576,11 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
             # would otherwise become black in JPEG.
             from PIL import Image as _Img
             _pimg = _Img.open(io.BytesIO(png_data))
+            _has_alpha = (_pimg.mode in ("RGBA", "LA", "PA")
+                         or (_pimg.mode == "P"
+                             and "transparency" in _pimg.info))
+            if _has_alpha:
+                _pimg = _pimg.convert("RGBA")
             _bg = _Img.new("RGB", _pimg.size, (255, 255, 255))
             if _pimg.mode == "RGBA":
                 _bg.paste(_pimg, mask=_pimg.split()[3])
@@ -2273,10 +2975,38 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
     for finput in soup.find_all("input", attrs={"type": "file"}):
         finput.decompose()
 
+    # 8e2. Convert <input type="range"> to plain text showing its value.
+    #      Used e.g. by Saudi Exchange for 52-week range sliders.
+    for rinput in soup.find_all("input", attrs={"type": "range"}):
+        val = rinput.get("value", "")
+        if val:
+            rinput.replace_with(val)
+        else:
+            rinput.decompose()
+
     # 8f. Remove empty lists (e.g. JS autocomplete placeholders)
     for ul in list(soup.find_all(("ul", "ol"))):
         if not ul.get_text(strip=True):
             ul.decompose()
+
+    # 8f2. Remove <ul> lists that duplicate a nearby <select>'s options.
+    #      JS-driven sites (e.g. Saudi Exchange) often have a visible <select>
+    #      AND a custom <ul> dropdown with the same items.
+    _all_selects = soup.find_all("select")
+    if _all_selects:
+        _select_opts = set()
+        for _sel in _all_selects:
+            for _opt in _sel.find_all("option"):
+                _ot = _opt.get_text(strip=True)
+                if _ot:
+                    _select_opts.add(_ot)
+        if _select_opts:
+            for ul in list(soup.find_all("ul")):
+                _li_texts = [li.get_text(strip=True)
+                             for li in ul.find_all("li") if li.get_text(strip=True)]
+                if len(_li_texts) >= 3 and all(
+                        t in _select_opts for t in _li_texts):
+                    ul.decompose()
 
     # 8g. Replace non-renderable Unicode (CJK, Devanagari, Thai, etc.)
     #     with bracketed labels so the page layout doesn't break on IE2.
@@ -2462,6 +3192,15 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
             if not tbl.get("cellspacing"):
                 tbl["cellspacing"] = "1"
 
+    # 11a2. Remove duplicate <thead> in tables.  JS frameworks often clone
+    #       the header row for a sticky/fixed-header effect.  Keep only the
+    #       first <thead> in each table.
+    for tbl in soup.find_all("table"):
+        theads = tbl.find_all("thead")
+        if len(theads) > 1:
+            for dup in theads[1:]:
+                dup.decompose()
+
     # 11b. Replace <div> with HTML 3.2 equivalents.
     #      IE2 does not understand <div> and renders its content inline,
     #      causing everything to flow as one long horizontal line.
@@ -2533,6 +3272,19 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
     content_html = content_html.replace("<br/>", "<br>")
     content_html = content_html.replace("<hr/>", "<hr>")
     content_html = re.sub(r"<(img\s[^>]*?)\s*/>", r"<\1>", content_html)
+
+    # 15a2. Strip portal framework junk text (e.g. IBM WebSphere Portal).
+    for _junk in ("LoginPortletPopupv2", "NO PORTLET SESSION YET",
+                   "AddtoWatchlistv2", "MarketWatchTodaywatchV2Portlet"):
+        content_html = content_html.replace(_junk, "")
+    # Remove every standalone "التصرفات" / "Actions" that appears as
+    # meaningless repeated text on Saudi Exchange portal pages.
+    content_html = re.sub(
+        r'[\u200f\s]*\u0627\u0644\u062a\u0635\u0631\u0641\u0627\u062a[\u200f\s]*',
+        '', content_html)
+    # Remove bare "Actions" portal placeholders (WebSphere Portal junk).
+    # They appear as standalone text between empty block tags.
+    content_html = re.sub(r'(?<=>)\s*Actions\s*(?=<)', '', content_html)
 
     # 15b. Convert runs of consecutive <a> links separated by <br> into
     #      horizontal table rows.  Nav menus become vertical after div
@@ -3017,7 +3769,11 @@ def _fetch_and_convert_image(url, target_w=0, target_h=0):
             if HAS_PIL:
                 img = Image.open(io.BytesIO(png_data))
                 # Composite onto white background (SVGs often have transparency)
-                if img.mode == "RGBA":
+                _has_alpha = (img.mode in ("RGBA", "LA", "PA")
+                              or (img.mode == "P"
+                                  and "transparency" in img.info))
+                if _has_alpha:
+                    img = img.convert("RGBA")
                     bg = Image.new("RGB", img.size, (255, 255, 255))
                     bg.paste(img, mask=img.split()[3])
                     img = bg
@@ -3034,12 +3790,25 @@ def _fetch_and_convert_image(url, target_w=0, target_h=0):
             # Can't convert SVG — return empty (will show 1x1 GIF fallback)
             raise ValueError("SVG cannot be converted")
 
+    # GIF: natively supported by all old browsers — pass through as-is
+    is_gif = "gif" in ctype or url.rstrip("/").lower().endswith(".gif")
+    if is_gif:
+        return raw, "image/gif"
+
     if not HAS_PIL:
         return raw, ctype
 
     try:
         img = Image.open(io.BytesIO(raw))
-        if img.mode not in ("RGB", "L"):
+        _has_alpha = (img.mode in ("RGBA", "LA", "PA")
+                      or (img.mode == "P" and "transparency" in img.info))
+        if _has_alpha:
+            # Composite onto white background to avoid black areas in JPEG
+            img = img.convert("RGBA")
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[3])
+            img = bg
+        elif img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
         # Apply target size from HTML (pre-resize for IE2 compatibility)
         if target_w or target_h:
@@ -3134,7 +3903,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # bodies) in CP-1256.  parse_qs defaults to UTF-8, which turns
         # the CP-1256 bytes into U+FFFD replacement characters.
         # Detect cp1256=1 in the raw query and re-parse if needed.
-        if "cp1256=1" in parsed.query:
+        # Also detect legacy OS browsers that may send CP-1256 without
+        # the explicit flag (e.g. YouTube search form on auto-detected
+        # CP-1256 pages).
+        _force_cp1256 = "cp1256=1" in parsed.query
+        if not _force_cp1256:
+            client_ua = self.headers.get("User-Agent", "")
+            if _detect_legacy_os(client_ua):
+                # Check if the query string has non-UTF-8 percent-encoded
+                # bytes (high bytes 0x80-0xFF that don't form valid UTF-8)
+                try:
+                    urllib.parse.unquote(parsed.query, encoding="utf-8",
+                                        errors="strict")
+                except (UnicodeDecodeError, ValueError):
+                    _force_cp1256 = True
+        if _force_cp1256:
             params = urllib.parse.parse_qs(parsed.query, encoding="cp1256")
 
         # For POST requests, merge body parameters into params
@@ -3227,8 +4010,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             typed = params.get("typed", [""])[0]
             if typed == "1" and not from_history and not is_search:
                 _get_history(self.client_address[0]).add(url)
-            # CP-1256: explicit checkbox OR auto-detect (legacy OS + Arabic)
-            use_cp1256 = params.get("cp1256", [""])[0] == "1"
+            # CP-1256: explicit checkbox, forced by encoding detection,
+            # or auto-detect (legacy OS + Arabic URL)
+            use_cp1256 = (params.get("cp1256", [""])[0] == "1"
+                          or _force_cp1256)
             if not use_cp1256:
                 client_ua = self.headers.get("User-Agent", "")
                 if _detect_legacy_os(client_ua) and _is_arabic_page(url):
@@ -3525,10 +4310,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         _JS_ONLY_HINTS = _JS_DISABLED_HINTS + (
                               b"enable js", b"enable javascript",
                               b"javascript required")
-        _CAPTCHA_HINTS = (b"captcha-delivery.com", b"captcha", b"datadome",
+        _CAPTCHA_HINTS = (b"captcha-delivery.com", b"datadome",
                           b"challenge-platform", b"turnstile",
-                          b"cf-challenge", b"hcaptcha", b"awswaf",
-                          b"challenge.js")
+                          b"cf-challenge", b"h-captcha.com",
+                          b"hcaptcha.com", b"awswaf",
+                          b"challenge.js", b"g-recaptcha",
+                          b"recaptcha/api", b"captcha_challenge")
         raw_lower_check = raw[:10000].lower()
         # For JS hints, search entire page (may be buried deep in SPAs)
         raw_lower_full = raw.lower()
@@ -3607,7 +4394,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         # YouTube: extract content from embedded JSON (the page is 100% JS)
-        yt = _youtube_extract(raw, url, proxy_host)
+        yt = _youtube_extract(raw, url, proxy_host, cp1256)
         if yt:
             yt_title, yt_content = yt
             # Auto-detect Arabic content on legacy OS
@@ -3615,11 +4402,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not yt_cp1256:
                 client_ua = self.headers.get("User-Agent", "")
                 if _detect_legacy_os(client_ua):
-                    if any("\u0600" <= ch <= "\u06FF"
-                           for ch in yt_content[:5000]):
-                        yt_cp1256 = True
+                    # Always enable cp1256 for legacy OS on YouTube
+                    # (search form needs it even without Arabic content)
+                    yt_cp1256 = True
+                    yt2 = _youtube_extract(raw, url, proxy_host, True)
+                    if yt2:
+                        yt_title, yt_content = yt2
+            # Detect RTL from the title (not nav bar which always has Arabic)
+            _yt_rtl = any("\u0600" <= ch <= "\u06FF" for ch in yt_title)
             html = _page_shell(yt_title, url, yt_content, proxy_host,
-                               cp1256=yt_cp1256,
+                               is_rtl=_yt_rtl, cp1256=yt_cp1256,
                                client_ip=self.client_address[0],
                                client_ua=self.headers.get("User-Agent", ""))
             if yt_cp1256:
@@ -3629,6 +4421,80 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(200, "text/html; charset=utf-8",
                            html.encode("utf-8", errors="replace"))
             return
+
+        # Sabq.org: extract content from embedded JSON (JS SPA)
+        sabq = _sabq_extract(raw, url, proxy_host, cp1256)
+        if sabq:
+            sabq_title, sabq_content = sabq
+            # sabq.org is always Arabic, auto-enable CP-1256 on legacy OS
+            sabq_cp1256 = cp1256
+            if not sabq_cp1256:
+                client_ua = self.headers.get("User-Agent", "")
+                if _detect_legacy_os(client_ua):
+                    sabq_cp1256 = True
+                    # Re-extract with cp1256 links
+                    sabq2 = _sabq_extract(raw, url, proxy_host, True)
+                    if sabq2:
+                        sabq_title, sabq_content = sabq2
+            html = _page_shell(sabq_title, url, sabq_content, proxy_host,
+                               is_rtl=True, cp1256=sabq_cp1256,
+                               client_ip=self.client_address[0],
+                               client_ua=self.headers.get("User-Agent", ""))
+            if sabq_cp1256:
+                self._send(200, "text/html; charset=windows-1256",
+                           html.encode("cp1256", errors="xmlcharrefreplace"))
+            else:
+                self._send(200, "text/html; charset=utf-8",
+                           html.encode("utf-8", errors="replace"))
+            return
+
+        # Saudi Exchange: stock data is loaded via JS after page load.
+        # Use headless Chromium to render the full page if available.
+        _se_host = urlparse(url).hostname or ""
+        if "saudiexchange.sa" in _se_host and HAS_SELENIUM:
+            print("  [Saudi Exchange] attempting JS render…",
+                  flush=True)
+            try:
+                _se_opts = ChromeOptions()
+                _se_opts.add_argument("--headless=new")
+                _se_opts.add_argument("--no-sandbox")
+                _se_opts.add_argument("--disable-dev-shm-usage")
+                _se_opts.add_argument("--disable-gpu")
+                _se_opts.add_argument("--window-size=1280,900")
+                # Disguise headless Chrome from bot detection
+                _se_opts.add_argument(
+                    "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64;"
+                    " x64) AppleWebKit/537.36 (KHTML, like Gecko)"
+                    " Chrome/120.0.0.0 Safari/537.36")
+                if HAS_WDM:
+                    _se_svc = ChromeService(ChromeDriverManager(
+                        chrome_type=ChromeType.CHROMIUM).install())
+                else:
+                    _se_svc = ChromeService()
+                _se_driver = webdriver.Chrome(service=_se_svc,
+                                              options=_se_opts)
+                try:
+                    import time as _tmod
+                    _se_driver.set_page_load_timeout(FETCH_TIMEOUT + 15)
+                    _se_driver.get(url)
+                    _tmod.sleep(8)  # wait for AJAX stock data to load
+                    _se_html = _se_driver.page_source
+                finally:
+                    _se_driver.quit()
+                _se_raw = _se_html.encode("utf-8", errors="replace")
+                print("  [Saudi Exchange] JS render got {} bytes "
+                      "(original {} bytes)".format(
+                          len(_se_raw), len(raw)), flush=True)
+                if len(_se_raw) > len(raw):
+                    raw = _se_raw
+                    print("  [Saudi Exchange] using JS-rendered version",
+                          flush=True)
+                else:
+                    print("  [Saudi Exchange] JS render too small, "
+                          "keeping original", flush=True)
+            except Exception as exc:
+                print("  [Saudi Exchange] JS render failed: {}".format(exc),
+                      flush=True)
 
         # Detect frameset pages — serve them directly with proxied frame URLs
         raw_lower = raw[:2000].lower()
