@@ -156,6 +156,12 @@ def _fetch_headers_for(url):
 _session = requests.Session()
 _session.headers.update(FETCH_HEADERS)
 
+# Cache for rasterized inline SVGs (hash → PNG bytes).
+# Old browsers (IE<8) don't support data: URIs, so we serve these via /svg/.
+import hashlib as _hashlib
+_svg_cache = {}          # {hex_hash: png_bytes}
+_SVG_CACHE_MAX = 500     # evict oldest when full
+
 # ── Tag rules ──────────────────────────────────────────────────────────────
 
 DROP_TAGS = frozenset({
@@ -314,6 +320,75 @@ def _parse_css_layouts(soup):
                 layouts[key] = info
 
     return layouts
+
+
+def _parse_css_img_sizes(soup):
+    """Parse CSS rules that set width/height/max-width/max-height on img
+    elements.  Returns a list of (ancestor_classes, width_px, height_px)
+    tuples.  max-width/max-height are used as fallback when no explicit
+    width/height is specified.
+    ancestor_classes is a list of class names from the selector that must
+    appear in the img's ancestor chain for the rule to match.
+    """
+    rules = []
+    for style_tag in soup.find_all("style"):
+        css_text = style_tag.get_text()
+        # Match rules ending in 'img' with size properties
+        for m in re.finditer(
+            r'((?:[.#][a-zA-Z0-9_-]+[\s>]*)+)\s*img\s*\{([^}]*)\}',
+            css_text
+        ):
+            selector_parts = m.group(1)
+            body = m.group(2)
+            # Prefer explicit width, fall back to max-width
+            wm = re.search(r'(?:^|[;\s])width\s*:\s*(\d+)\s*px', body)
+            if not wm:
+                wm = re.search(r'(?:^|[;\s])max-width\s*:\s*(\d+)\s*px',
+                               body)
+            # Prefer explicit height, fall back to max-height
+            hm = re.search(r'(?:^|[;\s])height\s*:\s*(\d+)\s*px', body)
+            if not hm:
+                hm = re.search(r'(?:^|[;\s])max-height\s*:\s*(\d+)\s*px',
+                               body)
+            if not wm and not hm:
+                continue
+            w = int(wm.group(1)) if wm else 0
+            h = int(hm.group(1)) if hm else 0
+            # Extract class names from selector (ignore IDs and tag names)
+            classes = re.findall(r'\.([a-zA-Z0-9_-]+)', selector_parts)
+            if classes:
+                rules.append((classes, w, h))
+    return rules
+
+
+def _css_img_size(img_tag, css_img_rules):
+    """Look up CSS-defined width/height for an <img> by matching its
+    ancestor class chain against parsed CSS rules.
+    Returns (width_str, height_str) or ("", "")."""
+    if not css_img_rules:
+        return "", ""
+    # Build set of ancestor class names (fast lookup)
+    ancestor_classes = set()
+    for anc in img_tag.parents:
+        if anc is None or not hasattr(anc, 'get'):
+            break
+        for c in anc.get("class", []):
+            ancestor_classes.add(c)
+    # Also include the img's own classes
+    for c in img_tag.get("class", []):
+        ancestor_classes.add(c)
+
+    # Find the most specific matching rule (most ancestor classes)
+    best_w, best_h, best_specificity = 0, 0, -1
+    for classes, w, h in css_img_rules:
+        if all(c in ancestor_classes for c in classes):
+            if len(classes) > best_specificity:
+                best_specificity = len(classes)
+                best_w, best_h = w, h
+    if best_specificity >= 0:
+        return (str(best_w) if best_w else "",
+                str(best_h) if best_h else "")
+    return "", ""
 
 
 def _get_layout(tag, css_layouts):
@@ -1244,8 +1319,241 @@ def _rewrite_frameset(raw_html, page_url, proxy_host):
     return title, str(soup)
 
 
-def _proxy_img(url, proxy_host):
-    return "http://{}/img/{}".format(proxy_host, unquote(url))
+def _proxy_img(url, proxy_host, width=0, height=0):
+    """Build an image proxy URL.  If width/height are given, append a
+    size hint so the proxy can pre-resize (for IE2 which ignores HTML
+    width/height attributes)."""
+    base = "http://{}/img/{}".format(proxy_host, unquote(url))
+    if width or height:
+        base += "?_w={}&_h={}".format(int(width) if width else 0,
+                                       int(height) if height else 0)
+    return base
+
+
+# ── YouTube extractor ──────────────────────────────────────────────────────
+
+def _youtube_extract(raw, page_url, proxy_host):
+    """Extract content from YouTube pages using embedded JSON data.
+    Returns (title, html) or None if not a YouTube URL or extraction fails."""
+    parsed = urlparse(page_url)
+    if parsed.hostname not in ("www.youtube.com", "youtube.com",
+                                "m.youtube.com"):
+        return None
+    try:
+        html_str = raw.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+    import re as _re, json as _json
+
+    # Extract ytInitialData
+    initial_data = None
+    m = _re.search(r'var ytInitialData = ({.*?});</script>', html_str)
+    if m:
+        try:
+            initial_data = _json.loads(m.group(1))
+        except Exception:
+            pass
+
+    # Extract ytInitialPlayerResponse (video pages)
+    player_data = None
+    m2 = _re.search(r'var ytInitialPlayerResponse = ({.*?});</script>',
+                     html_str)
+    if m2:
+        try:
+            player_data = _json.loads(m2.group(1))
+        except Exception:
+            pass
+
+    path = parsed.path
+    query = dict(urllib.parse.parse_qsl(parsed.query))
+    parts = []
+
+    # ── Video page (/watch?v=...) ──
+    if path == "/watch" and "v" in query and player_data:
+        vd = player_data.get("videoDetails", {})
+        title = vd.get("title", "YouTube Video")
+        author = vd.get("author", "")
+        views = vd.get("viewCount", "")
+        length = vd.get("lengthSeconds", "")
+        desc = vd.get("shortDescription", "")
+        thumb = vd.get("thumbnail", {}).get("thumbnails", [{}])[-1].get(
+            "url", "")
+
+        parts.append('<h2>{}</h2>'.format(_esc(title)))
+        if thumb:
+            parts.append('<p><img src="{}" width="480" alt="{}"></p>'.format(
+                _proxy_img(thumb, proxy_host), _esc(title)))
+        parts.append('<table border="0" cellpadding="2">')
+        if author:
+            parts.append('<tr><td><b>Channel:</b></td><td>{}</td></tr>'
+                         .format(_esc(author)))
+        if views:
+            parts.append('<tr><td><b>Views:</b></td><td>{}</td></tr>'
+                         .format(_esc("{:,}".format(int(views))
+                                      if views.isdigit() else views)))
+        if length:
+            try:
+                mins, secs = divmod(int(length), 60)
+                parts.append(
+                    '<tr><td><b>Length:</b></td><td>{}:{:02d}</td></tr>'
+                    .format(mins, secs))
+            except ValueError:
+                pass
+        parts.append('</table>')
+        if desc:
+            parts.append('<hr><p>{}</p>'.format(
+                _esc(desc).replace("\n", "<br>")))
+
+        # Related videos from ytInitialData
+        if initial_data:
+            related = []
+            secondary = initial_data.get("contents", {}).get(
+                "twoColumnWatchNextResults", {}).get(
+                "secondaryResults", {}).get(
+                "secondaryResults", {}).get("results", [])
+            for item in secondary[:15]:
+                cvr = item.get("compactVideoRenderer", {})
+                if not cvr:
+                    continue
+                r_title = cvr.get("title", {}).get("simpleText", "")
+                r_vid = cvr.get("videoId", "")
+                r_channel = cvr.get("longBylineText", {}).get(
+                    "runs", [{}])[0].get("text", "")
+                r_views = cvr.get("viewCountText", {}).get(
+                    "simpleText", "")
+                r_length = cvr.get("lengthText", {}).get(
+                    "simpleText", "")
+                if r_title and r_vid:
+                    related.append((r_title, r_vid, r_channel,
+                                    r_views, r_length))
+            if related:
+                parts.append('<hr><h3>Related Videos</h3>')
+                parts.append(
+                    '<table border="1" cellpadding="3" cellspacing="1">')
+                for r_title, r_vid, r_ch, r_v, r_l in related:
+                    link = _proxy_page(
+                        "https://www.youtube.com/watch?v=" + r_vid,
+                        proxy_host)
+                    parts.append(
+                        '<tr><td><a href="{}">{}</a></td>'
+                        '<td>{}</td><td>{}</td><td>{}</td></tr>'
+                        .format(link, _esc(r_title), _esc(r_ch),
+                                _esc(r_v), _esc(r_l)))
+                parts.append('</table>')
+
+        return title, "\n".join(parts)
+
+    # ── Search results (/results?search_query=...) ──
+    if path == "/results" and initial_data:
+        sq = query.get("search_query", "")
+        title = "YouTube: " + sq if sq else "YouTube Search"
+        results = []
+        try:
+            sections = initial_data["contents"][
+                "twoColumnSearchResultsRenderer"]["primaryContents"][
+                "sectionListRenderer"]["contents"]
+            for section in sections:
+                items = section.get("itemSectionRenderer", {}).get(
+                    "contents", [])
+                for item in items:
+                    vr = item.get("videoRenderer", {})
+                    if not vr:
+                        continue
+                    v_title = vr.get("title", {}).get("runs", [{}])[0].get(
+                        "text", "")
+                    v_id = vr.get("videoId", "")
+                    v_channel = vr.get("ownerText", {}).get(
+                        "runs", [{}])[0].get("text", "")
+                    v_views = vr.get("viewCountText", {}).get(
+                        "simpleText", "")
+                    v_length = vr.get("lengthText", {}).get(
+                        "simpleText", "")
+                    v_desc = ""
+                    snippets = vr.get("detailedMetadataSnippets", [])
+                    if snippets:
+                        runs = snippets[0].get("snippetText", {}).get(
+                            "runs", [])
+                        v_desc = "".join(r.get("text", "") for r in runs)
+                    v_thumb = ""
+                    thumbs = vr.get("thumbnail", {}).get("thumbnails", [])
+                    if thumbs:
+                        v_thumb = thumbs[-1].get("url", "")
+                    if v_title and v_id:
+                        results.append((v_title, v_id, v_channel,
+                                        v_views, v_length, v_desc, v_thumb))
+        except (KeyError, IndexError):
+            pass
+
+        if results:
+            parts.append('<h2>Search: {}</h2>'.format(_esc(sq)))
+            for v_title, v_id, v_ch, v_v, v_l, v_d, v_th in results[:20]:
+                link = _proxy_page(
+                    "https://www.youtube.com/watch?v=" + v_id, proxy_host)
+                parts.append('<table border="0" cellpadding="2">'
+                             '<tr><td valign="top">')
+                if v_th:
+                    parts.append(
+                        '<a href="{}"><img src="{}" width="120"></a>'
+                        .format(link, _proxy_img(v_th, proxy_host)))
+                parts.append('</td><td valign="top">')
+                parts.append('<b><a href="{}">{}</a></b>'.format(
+                    link, _esc(v_title)))
+                if v_ch:
+                    parts.append('<br><font size="2">{}</font>'.format(
+                        _esc(v_ch)))
+                meta = " | ".join(x for x in (v_v, v_l) if x)
+                if meta:
+                    parts.append('<br><font size="2">{}</font>'.format(
+                        _esc(meta)))
+                if v_d:
+                    parts.append(
+                        '<br><font size="1" color="#666666">{}</font>'
+                        .format(_esc(v_d)))
+                parts.append('</td></tr></table><br>')
+            return title, "\n".join(parts)
+
+    # ── Homepage or other page — show search form + category links ──
+    title = "YouTube"
+    parts.append('<h2>YouTube</h2>')
+    parts.append(
+        '<form action="http://{}/get" method="GET">'
+        '<input type="hidden" name="url" '
+        'value="https://www.youtube.com/results">'
+        '<b>Search YouTube:</b> '
+        '<input type="text" name="search_query" size="40"> '
+        '<input type="submit" value="Search">'
+        '</form><br>'.format(proxy_host))
+
+    # Try to extract guide/sidebar categories
+    if initial_data:
+        try:
+            guide_items = initial_data.get("header", {}).get(
+                "feedTabbedHeaderRenderer", {}).get("tabs", [])
+            if not guide_items:
+                guide_items = []
+            for gi in guide_items:
+                tab = gi.get("feedTabbedHeaderRenderer", {})
+                endpoint = tab.get("endpoint", {})
+        except Exception:
+            pass
+
+    parts.append('<p><b>Try searching for a video above, or browse '
+                 'a channel directly.</b></p>')
+    parts.append('<p>Example: '
+                 '<a href="{}">youtube.com/results?search_query=retro+computing'
+                 '</a></p>'.format(
+                     _proxy_page(
+                         "https://www.youtube.com/results?"
+                         "search_query=retro+computing", proxy_host)))
+
+    return title, "\n".join(parts)
+
+
+def _esc(text):
+    """HTML-escape text for safe embedding."""
+    return (text.replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
 
 def _abs(href, base_url):
     """Resolve href to absolute URL; return None if not http(s)."""
@@ -1471,6 +1779,7 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
 
     # 1b. Parse CSS layout information BEFORE removing <style> tags
     css_layouts = _parse_css_layouts(soup)
+    css_img_rules = _parse_css_img_sizes(soup)
 
     # 1c. Convert dropdown menus to <select> BEFORE stripping tags
     #     (needs class/id attrs and the original DOM structure intact)
@@ -1524,27 +1833,72 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
         elif _LOADING_RE.search(s):
             text_node.extract()
 
-    # 2b. Convert inline <svg> elements to base64 <img> tags.
+    # 2b. Convert inline <svg> elements to JPEG <img> tags.
     #     Old browsers can't render SVG at all, but cairosvg can rasterize
-    #     them into PNG which we then embed as a data: URI.
+    #     them into PNG → JPEG.
     for svg_tag in soup.find_all("svg"):
         try:
             import cairosvg as _cairosvg
             svg_bytes = str(svg_tag).encode("utf-8")
-            # Determine a reasonable render width from attributes
-            svg_w = svg_tag.get("width", "")
-            try:
-                render_w = min(int(re.sub(r"[^0-9]", "", str(svg_w))), MAX_IMG_W)
-            except (ValueError, TypeError):
-                render_w = 200
-            if render_w < 16:
-                render_w = 200
+            # Determine a reasonable render width from attributes:
+            # try width attr, then viewBox, then height attr.
+            render_w = 0
+            render_h = 0
+            for dim_attr, target in [("width", "w"), ("height", "h")]:
+                val = svg_tag.get(dim_attr, "")
+                try:
+                    n = int(re.sub(r"[^0-9]", "", str(val)))
+                    if target == "w":
+                        render_w = n
+                    else:
+                        render_h = n
+                except (ValueError, TypeError):
+                    pass
+            # Try viewBox="0 0 W H" for size hints
+            if not render_w:
+                vb = svg_tag.get("viewbox", svg_tag.get("viewBox", ""))
+                vb_parts = str(vb).split()
+                if len(vb_parts) == 4:
+                    try:
+                        render_w = int(float(vb_parts[2]))
+                        if not render_h:
+                            render_h = int(float(vb_parts[3]))
+                    except (ValueError, TypeError):
+                        pass
+            # Default to 200 only if we truly have no size info
+            if not render_w:
+                render_w = render_h if render_h else 200
+            render_w = min(render_w, MAX_IMG_W)
             png_data = _cairosvg.svg2png(bytestring=svg_bytes,
                                          output_width=render_w)
-            b64 = base64.b64encode(png_data).decode("ascii")
+            # Convert PNG → JPEG (IE3 doesn't support PNG).
+            # Composite onto white background first — PNG alpha channel
+            # would otherwise become black in JPEG.
+            from PIL import Image as _Img
+            _pimg = _Img.open(io.BytesIO(png_data))
+            _bg = _Img.new("RGB", _pimg.size, (255, 255, 255))
+            if _pimg.mode == "RGBA":
+                _bg.paste(_pimg, mask=_pimg.split()[3])
+            else:
+                _bg.paste(_pimg)
+            _buf = io.BytesIO()
+            _bg.save(_buf, format="JPEG", quality=85)
+            jpg_data = _buf.getvalue()
+            # Store in cache and reference via /svg/ URL (old browsers
+            # don't support data: URIs)
+            svg_hash = _hashlib.md5(svg_bytes).hexdigest()
+            if len(_svg_cache) >= _SVG_CACHE_MAX:
+                # evict oldest entry
+                _svg_cache.pop(next(iter(_svg_cache)), None)
+            _svg_cache[svg_hash] = jpg_data
             img_tag = soup.new_tag("img")
-            img_tag["src"] = "data:image/png;base64," + b64
+            img_tag["src"] = "http://{}/svg/{}.jpg".format(
+                proxy_host, svg_hash)
             img_tag["width"] = str(render_w)
+            if render_h:
+                img_tag["height"] = str(render_h)
+            # Mark as already-proxied so step 9 won't re-wrap in /img/
+            img_tag["data-svg"] = "1"
             if svg_tag.get("alt"):
                 img_tag["alt"] = svg_tag["alt"]
             svg_tag.replace_with(img_tag)
@@ -1556,7 +1910,16 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
     for tag in soup.find_all(DROP_TAGS):
         tag.decompose()
 
-    # 3a. Remove elements with classes/ids that indicate non-content
+    # 3a. Remove elements with inline display:none — these are hidden
+    #     (JS autocomplete, duplicate buttons, overlays, etc.)
+    for el in list(soup.find_all(True, style=True)):
+        if el.attrs is None:
+            continue
+        style_val = el.get("style", "")
+        if re.search(r'display\s*:\s*none', style_val, re.I):
+            el.decompose()
+
+    # 3c. Remove elements with classes/ids that indicate non-content
     #     (share buttons, ad spaces, popups, AI summaries, overlays)
     _JUNK_CLS_RE = re.compile(
         r"\b(share-buttons|ad-space|banner\d|popup|overlay-modal|"
@@ -1569,7 +1932,7 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
         if _JUNK_CLS_RE.search(ccls):
             el.decompose()
 
-    # 3b. Unwrap tags that may have swallowed article content
+    # 3d. Unwrap tags that may have swallowed article content
     for tag in soup.find_all(UNWRAP_TAGS):
         tag.unwrap()
 
@@ -1728,12 +2091,18 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
                 parts = []
                 if logo_img:
                     logo_img.extract()
-                    # Proxy the logo image src
-                    raw_src = _real_img_src(logo_img, page_url)
-                    if raw_src:
-                        logo_img.attrs = {}
-                        logo_img["src"] = _proxy_img(raw_src, proxy_host)
+                    # Already-proxied SVG images (from step 2b) need no
+                    # further processing — just keep them as-is.
+                    if logo_img.get("data-svg"):
+                        del logo_img["data-svg"]
                         logo_img["width"] = "150"
+                    else:
+                        # Proxy the logo image src
+                        raw_src = _real_img_src(logo_img, page_url)
+                        if raw_src:
+                            logo_img.attrs = {}
+                            logo_img["src"] = _proxy_img(raw_src, proxy_host)
+                            logo_img["width"] = "150"
                     parts.append(str(logo_img))
                 if brand_link:
                     brand_text = brand_link.get_text(strip=True)
@@ -1808,6 +2177,35 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
                 nav.clear()
                 nav.append(tbl)
 
+    # 7d. Convert carousel/slider containers to horizontal tables.
+    #     JS carousels (owl-carousel, slick, swiper, etc.) display children
+    #     horizontally but without JS they stack vertically.
+    _CAROUSEL_CLS_RE = re.compile(
+        r"\b(owl-carousel|slick-slider|slick-track|swiper-wrapper|"
+        r"carousel-inner|flickity-slider|glide__slides)\b", re.I)
+    for el in list(soup.find_all(True, class_=True)):
+        if el.attrs is None:
+            continue
+        cls = " ".join(el.get("class", []))
+        if not _CAROUSEL_CLS_RE.search(cls):
+            continue
+        # Collect direct children that have content
+        items = [c for c in el.find_all(True, recursive=False)
+                 if c.get_text(strip=True)]
+        if len(items) < 2:
+            continue
+        tbl = soup.new_tag("table", border="0", cellpadding="4",
+                           cellspacing="2")
+        tr = soup.new_tag("tr")
+        tbl.append(tr)
+        for item in items:
+            td = soup.new_tag("td", valign="top")
+            item.extract()
+            td.append(item)
+            tr.append(td)
+        el.clear()
+        el.append(tbl)
+
     # 8. Remap HTML5 semantic tags to HTML 3.2 equivalents
     for old_name, new_name in REMAP_TAGS.items():
         for tag in soup.find_all(old_name):
@@ -1867,7 +2265,17 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
         submit["value"] = btn_text
         btn.replace_with(submit)
 
-    # 8e. Replace non-renderable Unicode (CJK, Devanagari, Thai, etc.)
+    # 8e. Remove file upload inputs — they require JS and don't work
+    #     through the bridge (e.g. Google Lens image search).
+    for finput in soup.find_all("input", attrs={"type": "file"}):
+        finput.decompose()
+
+    # 8f. Remove empty lists (e.g. JS autocomplete placeholders)
+    for ul in list(soup.find_all(("ul", "ol"))):
+        if not ul.get_text(strip=True):
+            ul.decompose()
+
+    # 8g. Replace non-renderable Unicode (CJK, Devanagari, Thai, etc.)
     #     with bracketed labels so the page layout doesn't break on IE2.
     _replace_unrenderable_text(soup)
 
@@ -1877,10 +2285,41 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
         r"spacer|pixel|blank|arrow[_-]?icon|search[_-]?loader|"
         r"tools[_-]?logo)\b", re.I)
     for img in soup.find_all("img"):
+        # Skip SVG images already converted and proxied in step 2b
+        if img.get("data-svg"):
+            del img["data-svg"]
+            continue
         src = _real_img_src(img, page_url)
         alt    = img.get("alt", "")
         width  = img.get("width", "")
         height = img.get("height", "")
+        # Extract size from inline style (e.g. style="width:65px; height:65px")
+        img_style = img.get("style", "")
+        if img_style:
+            sw = re.search(r'(?:^|;)\s*width\s*:\s*(\d+)\s*px', img_style)
+            sh = re.search(r'(?:^|;)\s*height\s*:\s*(\d+)\s*px',
+                           img_style)
+            smh = re.search(r'(?:^|;)\s*min-height\s*:\s*(\d+)\s*px',
+                            img_style)
+            if sw and not width:
+                width = sw.group(1)
+            if sh and not height:
+                height = sh.group(1)
+            elif smh and not height:
+                height = smh.group(1)
+        # CSS stylesheet sizes (e.g. .numbers .image img { width: 40px }
+        # or .newsletter .image img { max-width: 180px })
+        # These are more specific than Bootstrap utility classes like w-100.
+        css_w, css_h = _css_img_size(img, css_img_rules)
+        if css_w and not width:
+            width = css_w
+        if css_h and not height:
+            height = css_h
+        # Bootstrap w-100: only use as last resort when no other size is known
+        if not width and not height:
+            img_cls = " ".join(img.get("class", []))
+            if "w-100" in img_cls:
+                width = str(MAX_IMG_W)
         # URL size hints (e.g. -140x140.webp) represent the intended
         # display size (thumbnail).  They override tag attributes which
         # may contain the raw/original image dimensions.
@@ -1903,10 +2342,11 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
             img.decompose()
             continue
         # SVG images: proxy them through the image converter which will
-        # rasterize via cairosvg → JPEG (falls back to 1x1 GIF if it fails)
+        # rasterize via cairosvg → JPEG (falls back to 1x1 GIF if it fails).
+        # SVGs without explicit size are almost always icons — cap to 48px.
         if src_lower.endswith(".svg"):
-            pass  # fall through to normal proxy handling below
-        img["src"] = _proxy_img(src, proxy_host)
+            if not width and not height:
+                width, height = "48", "48"
         if alt:
             img["alt"] = alt
         # Cap avatar/profile images to 36x36 when no size is specified
@@ -1916,19 +2356,33 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
                 r"user[_-]?(?:pic|img|image|photo))", re.I)
             if _AVATAR_RE.search(src_lower) or _AVATAR_RE.search(alt.lower()):
                 width, height = "36", "36"
+        # Resolve final pixel values for width/height
+        final_w = final_h = 0
         if width:
             try:
-                w = int(re.sub(r"[^0-9]", "", str(width)))
-                img["width"] = str(min(w, MAX_IMG_W))
+                final_w = min(int(re.sub(r"[^0-9]", "", str(width))),
+                              MAX_IMG_W)
+                img["width"] = str(final_w)
                 if height:
                     try:
                         h = int(re.sub(r"[^0-9]", "", str(height)))
-                        ratio = min(w, MAX_IMG_W) / w if w else 1
-                        img["height"] = str(int(h * ratio))
+                        ratio = final_w / int(re.sub(r"[^0-9]", "",
+                                              str(width))) if width else 1
+                        final_h = int(h * ratio)
+                        img["height"] = str(final_h)
                     except (ValueError, ZeroDivisionError):
                         pass
             except ValueError:
                 pass
+        elif height:
+            try:
+                final_h = int(re.sub(r"[^0-9]", "", str(height)))
+                img["height"] = str(final_h)
+            except ValueError:
+                pass
+        # Pass size hints to image proxy so it pre-resizes (for IE2
+        # which ignores HTML width/height attributes).
+        img["src"] = _proxy_img(src, proxy_host, final_w, final_h)
         img["border"] = "0"
 
     # 10. Fix <a> hrefs — route through proxy
@@ -2104,7 +2558,7 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
                     break
                 links.append(next_a.group(0))
                 end = next_a.end()
-            if len(links) >= 5:
+            if len(links) >= 3:
                 # Only convert if links look like a nav menu: all short
                 # text, and average length ≤ 20 chars (nav labels are
                 # brief; product titles or listing items are longer).
@@ -2282,7 +2736,12 @@ def _landing_html(ip, user_agent=""):
         )
     meta_charset = ""
     cp1256_hidden = ""
-    if legacy_os:
+    if legacy_os == "Windows 3.x":
+        # IE5 on Windows 3.x shows blank pages with Arabic default encoding;
+        # force Western charset to work around the bug.
+        meta_charset = \
+            '\n<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">'
+    elif legacy_os:
         meta_charset = \
             '\n<meta http-equiv="Content-Type" content="text/html; charset=windows-1256">'
         cp1256_hidden = '\n  <input type="hidden" name="cp1256" value="1">'
@@ -2399,7 +2858,8 @@ def _error_page(title, message):
 
 def _page_shell(title, current_url, content_html, proxy_host,
                 is_rtl=False, cp1256=False, client_ip="",
-                body_bg_img=None, body_bgcolor=None, body_attrs=None):
+                body_bg_img=None, body_bgcolor=None, body_attrs=None,
+                client_ua=""):
     escaped_url = current_url.replace('"', "%22").replace("'", "%27")
     safe_title = (
         title
@@ -2424,8 +2884,13 @@ def _page_shell(title, current_url, content_html, proxy_host,
         )
     cp_checked = " checked" if cp1256 else ""
     meta_charset = ""
-    if cp1256:
+    _is_win3x = _detect_legacy_os(client_ua) == "Windows 3.x"
+    if cp1256 and not _is_win3x:
         meta_charset = '\n    <meta http-equiv="Content-Type" content="text/html; charset=windows-1256">'
+    elif _is_win3x:
+        # IE5 on Windows 3.x shows blank pages with Arabic/non-Western
+        # default encoding; force Western charset to work around the bug.
+        meta_charset = '\n    <meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">'
     return """\
 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
 <html{html_dir}>
@@ -2521,10 +2986,12 @@ def _take_screenshot(url, width=SCREENSHOT_W, height=SCREENSHOT_H):
 
 # ── Image proxy ────────────────────────────────────────────────────────────
 
-def _fetch_and_convert_image(url):
+def _fetch_and_convert_image(url, target_w=0, target_h=0):
     """
     Fetch an image URL, resize and convert to JPEG via Pillow.
     SVGs are rasterized if cairosvg is available, otherwise skipped.
+    If target_w/target_h are given, the image is pre-resized to those
+    dimensions (for IE2 which ignores HTML width/height attributes).
     Returns (bytes, content_type) or raises on failure.
     """
     resp = _session.get(
@@ -2540,11 +3007,22 @@ def _fetch_and_convert_image(url):
         # Try cairosvg → PNG → JPEG
         try:
             import cairosvg
-            png_data = cairosvg.svg2png(bytestring=raw, output_width=200)
+            # Use target width for rasterization if available
+            render_w = target_w if target_w else 200
+            png_data = cairosvg.svg2png(bytestring=raw,
+                                         output_width=render_w)
             if HAS_PIL:
                 img = Image.open(io.BytesIO(png_data))
-                if img.mode not in ("RGB", "L"):
+                # Composite onto white background (SVGs often have transparency)
+                if img.mode == "RGBA":
+                    bg = Image.new("RGB", img.size, (255, 255, 255))
+                    bg.paste(img, mask=img.split()[3])
+                    img = bg
+                elif img.mode not in ("RGB", "L"):
                     img = img.convert("RGB")
+                # Apply target size if specified
+                if target_w or target_h:
+                    img = _resize_to_target(img, target_w, target_h)
                 buf = io.BytesIO()
                 img.save(buf, format="JPEG", quality=75)
                 return buf.getvalue(), "image/jpeg"
@@ -2560,13 +3038,39 @@ def _fetch_and_convert_image(url):
         img = Image.open(io.BytesIO(raw))
         if img.mode not in ("RGB", "L"):
             img = img.convert("RGB")
-        if img.width > MAX_IMG_W or img.height > MAX_IMG_H:
+        # Apply target size from HTML (pre-resize for IE2 compatibility)
+        if target_w or target_h:
+            img = _resize_to_target(img, target_w, target_h)
+        elif img.width > MAX_IMG_W or img.height > MAX_IMG_H:
             img.thumbnail((MAX_IMG_W, MAX_IMG_H), Image.LANCZOS)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=75, optimize=True)
         return buf.getvalue(), "image/jpeg"
     except Exception:
         return raw, ctype
+
+
+def _resize_to_target(img, target_w, target_h):
+    """Resize a PIL Image to target dimensions, preserving aspect ratio.
+    If only one dimension is given, the other is calculated from the
+    image's natural aspect ratio."""
+    orig_w, orig_h = img.size
+    if target_w and target_h:
+        w, h = target_w, target_h
+    elif target_w:
+        ratio = target_w / orig_w if orig_w else 1
+        w, h = target_w, max(1, int(orig_h * ratio))
+    elif target_h:
+        ratio = target_h / orig_h if orig_h else 1
+        w, h = max(1, int(orig_w * ratio)), target_h
+    else:
+        return img
+    w = min(w, MAX_IMG_W)
+    h = min(h, MAX_IMG_H)
+    if w >= orig_w and h >= orig_h:
+        return img  # don't upscale
+    img.thumbnail((w, h), Image.LANCZOS)
+    return img
 
 
 # ── Search engine helpers ─────────────────────────────────────────────────
@@ -2760,13 +3264,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
             url = _resolve_ddg_redirect(url)
             self._serve_page(url, proxy_host, use_cp1256)
 
+        elif path.startswith("/svg/"):
+            # /svg/<hash>.jpg — serve rasterized inline SVG from cache
+            svg_key = path[5:].replace(".jpg", "").replace(".png", "")
+            jpg_data = _svg_cache.get(svg_key)
+            if jpg_data:
+                self._send(200, "image/jpeg", jpg_data)
+            else:
+                self._send(404, "text/plain; charset=utf-8",
+                           b"SVG image expired or not found")
+            return
+
         elif path.startswith("/img/"):
-            # /img/http://example.com/pic.jpg — path-based image proxy
-            url = self.path[5:]          # everything after "/img/"
-            if not url:
+            # /img/http://example.com/pic.jpg?_w=40&_h=40 — path-based
+            # image proxy with optional size hints for pre-resizing.
+            img_path = self.path[5:]     # everything after "/img/"
+            if not img_path:
                 self._send(404, "text/plain; charset=utf-8", b"No URL")
                 return
-            self._serve_image(url)
+            # Extract size hints from our _w/_h params
+            target_w = target_h = 0
+            if "?_w=" in img_path or "&_w=" in img_path:
+                _pw = re.search(r'[?&]_w=(\d+)', img_path)
+                _ph = re.search(r'[?&]_h=(\d+)', img_path)
+                if _pw:
+                    target_w = int(_pw.group(1))
+                if _ph:
+                    target_h = int(_ph.group(1))
+                # Strip our params from the URL (keep original query)
+                img_path = re.sub(r'[?&]_[wh]=\d+', '', img_path)
+                # Clean up leftover ? or &
+                img_path = img_path.replace('?&', '?').rstrip('?')
+            self._serve_image(img_path, target_w, target_h)
 
         elif path == "/img":
             # Legacy query-string form: /img?url=...
@@ -2866,10 +3395,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     timeout=FETCH_TIMEOUT, allow_redirects=True,
                 )
             else:
-                resp = _session.get(
-                    url, headers=_fetch_headers_for(url),
-                    timeout=FETCH_TIMEOUT, allow_redirects=True,
-                )
+                try:
+                    resp = _session.get(
+                        url, headers=_fetch_headers_for(url),
+                        timeout=FETCH_TIMEOUT, allow_redirects=True,
+                    )
+                except RequestException as ssl_exc:
+                    # HTTPS may fail on HTTP-only sites; fall back to HTTP
+                    if url.startswith("https://"):
+                        http_url = "http://" + url[8:]
+                        resp = _session.get(
+                            http_url, headers=_fetch_headers_for(http_url),
+                            timeout=FETCH_TIMEOUT, allow_redirects=True,
+                        )
+                        url = http_url
+                    else:
+                        raise
             # On 401/403, retry with Googlebot UA — many sites block
             # unknown user agents but serve content to crawlers.
             if resp.status_code in (401, 403) and not post_data:
@@ -2890,7 +3431,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # (some sites return useful content with 4xx/5xx status).
             if hasattr(exc, 'response') and exc.response is not None:
                 err_ctype = exc.response.headers.get("Content-Type", "")
-                if "text/html" in err_ctype and len(exc.response.content) > 200:
+                if "text/html" in err_ctype and len(exc.response.content) > 0:
                     raw = exc.response.content
                     resp = exc.response
                     # Fall through — JS stub detection below may upgrade
@@ -3062,6 +3603,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(200, "text/html; charset=utf-8", body)
             return
 
+        # YouTube: extract content from embedded JSON (the page is 100% JS)
+        yt = _youtube_extract(raw, url, proxy_host)
+        if yt:
+            yt_title, yt_content = yt
+            # Auto-detect Arabic content on legacy OS
+            yt_cp1256 = cp1256
+            if not yt_cp1256:
+                client_ua = self.headers.get("User-Agent", "")
+                if _detect_legacy_os(client_ua):
+                    if any("\u0600" <= ch <= "\u06FF"
+                           for ch in yt_content[:5000]):
+                        yt_cp1256 = True
+            html = _page_shell(yt_title, url, yt_content, proxy_host,
+                               cp1256=yt_cp1256,
+                               client_ip=self.client_address[0],
+                               client_ua=self.headers.get("User-Agent", ""))
+            if yt_cp1256:
+                self._send(200, "text/html; charset=windows-1256",
+                           html.encode("cp1256", errors="xmlcharrefreplace"))
+            else:
+                self._send(200, "text/html; charset=utf-8",
+                           html.encode("utf-8", errors="replace"))
+            return
+
         # Detect frameset pages — serve them directly with proxied frame URLs
         raw_lower = raw[:2000].lower()
         if b"<frameset" in raw_lower:
@@ -3079,12 +3644,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             title, content, is_rtl, js_only, bg_img, bg_color, b_attrs = \
                 transform_html(raw, resp.url, proxy_host, cp1256)
+            # Auto-detect Arabic content on legacy OS: if the response
+            # contains Arabic characters, switch to CP-1256 even if the
+            # URL didn't look Arabic (e.g. google.com with Arabic locale).
+            if not cp1256:
+                client_ua = self.headers.get("User-Agent", "")
+                if _detect_legacy_os(client_ua):
+                    # Check for Arabic Unicode range (U+0600–U+06FF)
+                    _sample = content[:5000]
+                    if any("\u0600" <= ch <= "\u06FF" for ch in _sample):
+                        cp1256 = True
+                        # Re-transform with cp1256 links (/p1/ prefix)
+                        title, content, is_rtl, js_only, bg_img, \
+                            bg_color, b_attrs = transform_html(
+                                raw, resp.url, proxy_host, cp1256)
             html = _page_shell(title, resp.url, content, proxy_host,
                                is_rtl, cp1256,
                                client_ip=self.client_address[0],
                                body_bg_img=bg_img,
                                body_bgcolor=bg_color,
-                               body_attrs=b_attrs)
+                               body_attrs=b_attrs,
+                               client_ua=self.headers.get("User-Agent", ""))
             if cp1256:
                 charset = "windows-1256"
                 html_bytes = html.encode("cp1256", errors="xmlcharrefreplace")
@@ -3102,9 +3682,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             )
             self._send(200, "text/html; charset=utf-8", body)
 
-    def _serve_image(self, url):
+    def _serve_image(self, url, target_w=0, target_h=0):
         try:
-            data, ctype = _fetch_and_convert_image(url)
+            data, ctype = _fetch_and_convert_image(url, target_w, target_h)
             self._send(200, ctype, data)
         except Exception:
             gif1x1 = (
