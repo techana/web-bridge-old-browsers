@@ -3,11 +3,14 @@
 Web Bridge for Old Browsers — port 8888
 
 Fetches any website and strips modern features (JavaScript, CSS, video,
-HTML5 layout) returning clean HTML 3.2 compatible with Netscape 3/4 and
-IE 3/4/5 running on Windows 3.1 / 95 / 98.
+HTML5 layout) returning classic HTML compatible with browsers as old as
+IE 2 (1995), through IE 3/4/5 and Netscape 3/4, running on Windows 3.1,
+95, or 98.
 
 Layout is analyzed from embedded CSS (grid/flex) and reproduced with
-<table> tags.  Images are proxied and converted to JPEG.
+<table> tags.  Images are proxied, converted to JPEG, and pre-resized
+at the proxy level for IE2 compatibility.  SVGs are rasterized via
+cairosvg.  YouTube pages are extracted from embedded JSON.
 
 Usage:
     python3 web_bridge.py

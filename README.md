@@ -1,48 +1,81 @@
 # Web Bridge for Old Browsers
 
 A lightweight web bridge that fetches modern websites and converts them to
-**HTML 3.2**, making them viewable on classic browsers such as Internet
-Explorer 2/3/4/5 and Netscape Navigator 3/4 running on Windows 3.1, 95, or 98.
+classic HTML, making them viewable on browsers as old as **Internet Explorer 2**
+(1995) through IE5, and **Netscape Navigator 3/4**, running on
+**Windows 3.1**, 95, or 98.
 
-It strips JavaScript, CSS, video, SVG, and HTML5 layout elements, then
+While the output uses HTML 3.2 as its baseline, the bridge goes further to
+ensure compatibility with **pre-HTML 3.2 browsers** like IE2:
+
+- Images are **pre-resized at the proxy level** so browsers that ignore HTML
+  `width`/`height` attributes (added in HTML 3.2) still display them correctly
+- No `data:` URIs (unsupported before IE8) -- inline SVGs are rasterized to
+  JPEG and served through a dedicated `/svg/` endpoint
+- JPEG only -- no PNG (unsupported in IE3 and earlier)
+- No `<div>`, `<span>`, or `<button>` tags (unsupported in IE2)
+- Path-based URLs instead of percent-encoded query strings (IE2 mangles `%XX`)
+
+The bridge strips JavaScript, CSS, video, SVG, and HTML5 layout elements, then
 rebuilds the page structure using `<table>` tags and classic HTML attributes
-(`bgcolor`, `align`, `<font>`, etc.).  Special care is taken for very old
-browsers like IE2 that do not support `<div>`, `<span>`, or `<button>`.
+(`bgcolor`, `align`, `<font>`, etc.).
 
 ## المزايا
 
-- **مخرجات HTML 3.2** -- بدون CSS أو JavaScript، تخطيط بالجداول
-- **تصفح مواقع HTTPS** -- يتيح للحواسيب والمتصفحات القديمة التي لا تدعم التشفير الحديث (TLS 1.2/1.3) الوصول إلى مواقع HTTPS عبر الجسر
+- **توافق من IE2 إلى IE5** -- يعمل مع متصفحات ما قبل HTML 3.2 (IE2) وما بعدها
+- **مخرجات HTML كلاسيكية** -- بدون CSS أو JavaScript، تخطيط بالجداول
+- **تصفح مواقع HTTPS** -- يتيح للحواسيب والمتصفحات القديمة التي لا تدعم التشفير الحديث (TLS 1.2/1.3) الوصول إلى مواقع HTTPS عبر الجسر، مع التراجع التلقائي إلى HTTP عند فشل HTTPS
 - **تحويل تخطيطات CSS الحديثة** -- يحوّل grid و flex إلى جداول `<table>`
-- **معالجة الصور** -- يجلب الصور ويحوّلها إلى JPEG ويعيد تحجيمها لتناسب شاشات 640×480
+- **معالجة الصور** -- يجلب الصور ويحوّلها إلى JPEG ويعيد تحجيمها مسبقاً حسب الأبعاد المحددة في HTML وCSS (لتوافق IE2 الذي يتجاهل خصائص width/height)
+- **تحويل SVG** -- يحوّل صور SVG المضمّنة والخارجية إلى JPEG عبر cairosvg، مع استخراج الأبعاد من viewBox وقواعد CSS
+- **استخراج أبعاد الصور من CSS** -- يقرأ width و height و max-width من قواعد الأنماط ويطبّقها على الصور
+- **دعم YouTube** -- يستخرج بيانات الفيديو والبحث من JSON المضمّن (YouTube معتمد بالكامل على JavaScript)
 - **دعم اللغة العربية والاتجاه من اليمين لليسار** -- يكتشف الصفحات العربية ويضبط `dir="rtl"`
-- **ترميز CP-1256** -- خيار لتحويل النصوص العربية من Unicode إلى Windows-1256 للأنظمة القديمة
-- **معالجة النصوص غير القابلة للعرض** -- يزيل الأحرف غير اللاتينية وغير العربية (مثل اليابانية والصينية) التي تسبب مشاكل في العرض
+- **ترميز CP-1256 تلقائي** -- يكتشف المحتوى العربي تلقائياً ويحوّله إلى Windows-1256 على الأنظمة القديمة، حتى لو لم يكن عنوان الموقع عربياً
+- **إصلاح Windows 3.x** -- يفرض ترميز iso-8859-1 لحل مشكلة الصفحات الفارغة في IE5 على Windows 3.11
+- **إزالة العناصر المخفية** -- يحذف العناصر ذات display:none (أزرار مكررة، قوائم إكمال تلقائي)
+- **تحويل العروض الدوّارة** -- يحوّل owl-carousel و slick و swiper إلى جداول أفقية
+- **معالجة النصوص غير القابلة للعرض** -- يزيل الأحرف غير اللاتينية وغير العربية التي تسبب مشاكل في العرض
 - **لقطة شاشة** -- زر لالتقاط صورة للموقع الأصلي وعرضها كصورة JPEG
 - **سجل التصفح** -- يحفظ العناوين المكتوبة يدوياً لكل مستخدم (حسب عنوان IP)
 - **القوائم المنسدلة** -- يحوّل القوائم الحديثة إلى عناصر `<select>`
 - **بديل بحث Google** -- يحوّل بحث Google إلى DuckDuckGo (لأن Google يتطلب JavaScript)
 - **إعادة كتابة النماذج** -- يعيد توجيه النماذج للعمل من خلال الجسر
 - **عزل الأقسام** -- يغلّف كل قسم في جدول مستقل لمنع تجاوز التخطيط
-- **روابط بدون ترميز نسبي** -- يستخدم مسارات كاملة بدلاً من `%XX` لتوافق IE2
-- **توافق مع IE2** -- يزيل `<div>` و `<span>` و `<button>` التي لا يدعمها IE2
+- **كشف CAPTCHA و SPA** -- يعيد المحاولة بهوية Googlebot للصفحات المحمية، ويكتشف صفحات JavaScript فقط
+- **توافق مع IE2** -- يزيل `<div>` و `<span>` و `<button>`، يستخدم مسارات كاملة بدلاً من `%XX`
 
 ## Features
 
-- **HTML 3.2 output** -- no CSS, no JavaScript, table-based layout
+- **IE2 through IE5 compatibility** -- works with pre-HTML 3.2 browsers (IE2)
+  and later; images pre-resized at the proxy level for browsers that ignore
+  HTML `width`/`height` attributes
+- **Classic HTML output** -- no CSS, no JavaScript, table-based layout
 - **HTTPS browsing** -- allows old computers and browsers that do not support
-  modern encryption (TLS 1.2/1.3) to access HTTPS websites through the bridge
+  modern encryption (TLS 1.2/1.3) to access HTTPS websites through the bridge,
+  with automatic HTTPS-to-HTTP fallback for HTTP-only sites
 - **CSS grid/flex to table conversion** -- parses embedded stylesheets and
   reproduces layouts with `<table>` elements
-- **Image handling** -- fetches images, converts them to JPEG, and resizes to
-  fit 640x480 screens (requires Pillow)
+- **Image handling** -- fetches images, converts to JPEG, and pre-resizes to
+  the dimensions specified in HTML attributes, inline styles, and CSS
+  stylesheet rules (width, height, max-width from ancestor class chains)
+- **SVG rasterization** -- converts inline and external SVG images to JPEG via
+  cairosvg, extracts dimensions from viewBox and CSS rules, composites onto
+  white background, serves via dedicated `/svg/` endpoint (no `data:` URIs)
+- **YouTube support** -- extracts video info, search results, and related
+  videos from embedded JSON data (YouTube is 100% JavaScript-rendered)
 - **RTL / Arabic support** -- detects right-to-left pages and sets `dir="rtl"`
-- **CP-1256 encoding** -- optional checkbox to convert Unicode Arabic text to
-  Windows-1256 for old systems that lack Unicode support; correctly handles
-  CP-1256 encoded form submissions and Arabic text in URLs
+- **Auto CP-1256 encoding** -- automatically detects Arabic content in the
+  response and enables Windows-1256 encoding on legacy OS, even when the URL
+  does not appear Arabic (e.g. google.com with Arabic locale)
+- **Windows 3.x fix** -- forces iso-8859-1 charset to work around the IE5
+  blank page bug on Windows 3.11
+- **Hidden element removal** -- strips `display:none` elements (duplicate
+  buttons, JS autocomplete suggestions, overlays)
+- **Carousel/slider conversion** -- detects owl-carousel, slick, swiper, and
+  other JS carousels and converts them to horizontal tables
 - **Non-renderable Unicode handling** -- strips CJK, Devanagari, Thai, and
-  other scripts that Windows 95/IE2 cannot display, preventing layout-breaking
-  horizontal overflow
+  other scripts that Windows 95/IE2 cannot display
 - **Page screenshots** -- capture a full rendering of the original page as a
   JPEG image via headless Chromium (requires Selenium), with selectable
   resolution (640x480 up to 1600x1200)
@@ -56,21 +89,28 @@ browsers like IE2 that do not support `<div>`, `<span>`, or `<button>`.
   bridge
 - **Section isolation** -- wraps page sections in independent tables to prevent
   layout overflow
-- **IE2 compatibility** -- eliminates `<div>`, `<span>`, and `<button>` tags
-  that IE2 does not support; uses path-based URLs to avoid `%`-encoding
+- **CAPTCHA and SPA detection** -- retries with Googlebot UA for blocked pages,
+  detects JavaScript-only SPAs with minimal body text, shows clear error for
+  CAPTCHA-protected sites
+- **Frameset support** -- detects and rewrites `<frameset>` pages with proxied
+  frame URLs
+- **IE2 deep compatibility** -- eliminates `<div>`, `<span>`, `<button>`, and
+  `<input type="file">` tags; uses path-based URLs to avoid `%`-encoding;
+  removes empty lists and JS-only form elements
 
 ## Requirements
 
 - Python 3.6 or later
 - The following Python packages:
 
-| Package            | Purpose                          | Required? |
-|--------------------|----------------------------------|-----------|
-| `requests`         | Fetching web pages               | Yes       |
-| `beautifulsoup4`   | HTML parsing and transformation  | Yes       |
-| `Pillow`           | Image conversion and resizing    | Optional  |
-| `selenium`         | Screenshot capture               | Optional  |
-| `webdriver-manager`| Auto-install ChromeDriver        | Optional  |
+| Package            | Purpose                              | Required? |
+|--------------------|--------------------------------------|-----------|
+| `requests`         | Fetching web pages                   | Yes       |
+| `beautifulsoup4`   | HTML parsing and transformation      | Yes       |
+| `Pillow`           | Image conversion and resizing        | Optional  |
+| `cairosvg`         | SVG rasterization to PNG/JPEG        | Optional  |
+| `selenium`         | Screenshot and JS rendering fallback | Optional  |
+| `webdriver-manager`| Auto-install ChromeDriver            | Optional  |
 
 For the screenshot feature, **Chromium** must also be installed on the server:
 
@@ -90,9 +130,9 @@ git clone https://github.com/techana/web-bridge-old-browsers.git
 cd web-bridge-old-browsers
 
 # Install core dependencies
-pip install requests beautifulsoup4 Pillow
+pip install requests beautifulsoup4 Pillow cairosvg
 
-# Optional: install screenshot dependencies
+# Optional: install screenshot and JS rendering dependencies
 pip install selenium webdriver-manager
 ```
 
