@@ -1853,7 +1853,7 @@ def _youtube_extract(raw, page_url, proxy_host, cp1256=False):
 
         parts.append('<h2>{}</h2>'.format(_esc(title)))
         if thumb:
-            parts.append('<p><img src="{}" width="480" alt="{}"></p>'.format(
+            parts.append('<p><img src="{}" width="440" alt="{}"></p>'.format(
                 _proxy_img(thumb, proxy_host), _esc(title)))
         parts.append('<table border="0" cellpadding="2">')
         if author:
@@ -2653,8 +2653,16 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
 
     # 3a. Remove elements with inline display:none — these are hidden
     #     (JS autocomplete, duplicate buttons, overlays, etc.)
+    #     Skip void elements (img, br, hr, input…) — html.parser can
+    #     misparse self-closing tags like <img … style="display:none"/>
+    #     as open containers that swallow all subsequent content.
+    _VOID_TAGS = frozenset({"img", "br", "hr", "input", "meta", "link",
+                            "area", "base", "col", "embed", "source",
+                            "track", "wbr", "param"})
     for el in list(soup.find_all(True, style=True)):
         if el.attrs is None:
+            continue
+        if el.name in _VOID_TAGS:
             continue
         style_val = el.get("style", "")
         if re.search(r'display\s*:\s*none', style_val, re.I):
@@ -3216,19 +3224,21 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
                 r"user[_-]?(?:pic|img|image|photo))", re.I)
             if _AVATAR_RE.search(src_lower) or _AVATAR_RE.search(alt.lower()):
                 width, height = "36", "36"
-        # Resolve final pixel values for width/height
+        # Resolve final pixel values for width/height.
+        # Use int(float()) to handle decimal values like "293.33"
+        # (int(re.sub("[^0-9]","","293.33")) would give 29333!).
         final_w = final_h = 0
         if width:
             try:
-                final_w = min(int(re.sub(r"[^0-9]", "", str(width))),
-                              MAX_IMG_W)
+                raw_w = int(float(re.sub(r"[^0-9.]", "", str(width))))
+                final_w = min(raw_w, MAX_IMG_W)
                 img["width"] = str(final_w)
                 if height:
                     try:
-                        h = int(re.sub(r"[^0-9]", "", str(height)))
-                        ratio = final_w / int(re.sub(r"[^0-9]", "",
-                                              str(width))) if width else 1
-                        final_h = int(h * ratio)
+                        raw_h = int(float(re.sub(r"[^0-9.]", "",
+                                                  str(height))))
+                        ratio = final_w / raw_w if raw_w else 1
+                        final_h = min(int(raw_h * ratio), MAX_IMG_H)
                         img["height"] = str(final_h)
                     except (ValueError, ZeroDivisionError):
                         pass
@@ -3236,7 +3246,9 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
                 pass
         elif height:
             try:
-                final_h = int(re.sub(r"[^0-9]", "", str(height)))
+                final_h = min(
+                    int(float(re.sub(r"[^0-9.]", "", str(height)))),
+                    MAX_IMG_H)
                 img["height"] = str(final_h)
             except ValueError:
                 pass
@@ -3373,6 +3385,45 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
         if len(theads) > 1:
             for dup in theads[1:]:
                 dup.decompose()
+
+    # 11a3. Linearize multi-column table rows that are too wide for old
+    #       screens.  CSS grid/flex conversion may create 3+ column rows
+    #       where each cell holds a large image (480px+).  On 640–800px
+    #       screens this forces horizontal scrolling.  Convert such rows
+    #       into stacked single-column rows.
+    for tbl in soup.find_all("table"):
+        for tr in list(tbl.find_all("tr", recursive=False)):
+            tds = tr.find_all("td", recursive=False)
+            if len(tds) < 3:
+                continue
+            # Check if any cell contains a large image
+            has_big_img = False
+            for td in tds:
+                for img in td.find_all("img"):
+                    try:
+                        iw = int(img.get("width", 0) or 0)
+                    except (ValueError, TypeError):
+                        iw = 0
+                    if iw >= 300:
+                        has_big_img = True
+                        break
+                if has_big_img:
+                    break
+            if not has_big_img:
+                continue
+            # Linearize: convert each td to its own tr
+            for td in tds[1:]:
+                new_tr = soup.new_tag("tr")
+                td.extract()
+                td["width"] = ""
+                td["colspan"] = str(len(tds))
+                new_tr.append(td)
+                tr.insert_after(new_tr)
+                tr = new_tr  # insert next one after this
+            # Fix the first cell
+            first_td = tds[0]
+            first_td["width"] = ""
+            first_td["colspan"] = str(len(tds))
 
     # 11b. Replace <div> with HTML 3.2 equivalents.
     #      IE2 does not understand <div> and renders its content inline,
@@ -3650,6 +3701,27 @@ def _is_arabic_page(url):
     return False
 
 
+# ── Landing page logo (generated once at startup) ────────────────────────
+_LOGO_GIF = b""  # populated by _generate_logo()
+
+def _generate_logo():
+    """Load the logo GIF from disk (wb-logo.gif next to this script)."""
+    global _LOGO_GIF
+    try:
+        import os as _los
+        _logo_path = _los.path.join(
+            _los.path.dirname(_los.path.abspath(__file__)), "wb-logo.gif")
+        with open(_logo_path, "rb") as _f:
+            _LOGO_GIF = _f.read()
+
+        buf = _lio.BytesIO()
+        img.save(buf, "GIF", optimize=True)
+        _LOGO_GIF = buf.getvalue()
+        print("  Logo   : generated ({} bytes)".format(len(_LOGO_GIF)))
+    except Exception as exc:
+        print("  Logo   : generation failed ({})".format(exc))
+
+
 def _landing_html(ip, user_agent=""):
     legacy_os = _detect_legacy_os(user_agent)
     hist_opts = _history_options(ip)
@@ -3657,7 +3729,7 @@ def _landing_html(ip, user_agent=""):
     if hist_opts:
         hist_html = (
             '  <tr>\n'
-            '    <td><font face="Arial,Helvetica" size="2"><b>Recent:</b></font></td>\n'
+            '    <td><font face="Arial,Helvetica" size="2"><b>History:</b></font></td>\n'
             '    <td><select name="hist"><option value="">-- choose --</option>'
             '{}</select></td>\n'
             '  </tr>\n'.format(hist_opts)
@@ -3674,7 +3746,7 @@ def _landing_html(ip, user_agent=""):
             '\n<meta http-equiv="Content-Type" content="text/html; charset=windows-1256">'
         cp1256_hidden = '\n  <input type="hidden" name="cp1256" value="1">'
     arabic_warning = (
-        '<table width="460" border="0" cellpadding="6" cellspacing="0">\n'
+        '<table width="440" border="0" cellpadding="6" cellspacing="0">\n'
         '<tr><td dir="rtl" align="right">\n'
         '<font face="Courier New,Tahoma,Arial,sans-serif" size="1" color="#cc0000">\n'
         '  <b>\u062a\u062d\u0630\u064a\u0631:</b>'
@@ -3701,23 +3773,20 @@ def _landing_html(ip, user_agent=""):
 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
 <html>
 <head><title>Web Bridge for Old Browsers</title>{meta_charset}</head>
-<body bgcolor="#c0c0c0" text="#000000" link="#000080" vlink="#800080">
+<body bgcolor="#d1d1d1" text="#000000" link="#000080" vlink="#800080">
 <br><br>
 <center>
-<table width="460" border="2" cellpadding="0" cellspacing="2" bgcolor="#808080">
+<table width="440" border="2" cellpadding="0" cellspacing="2">
 <tr><td>
-<table width="100%" border="0" cellpadding="10" cellspacing="0">
-<tr><td bgcolor="#000080">
-  <font face="Arial,Helvetica,sans-serif" size="5" color="#ffffff">
-    <b>&nbsp;Web Bridge</b>
-  </font>
-  <font face="Arial,Helvetica,sans-serif" size="2" color="#aabfff">
-    &nbsp;for classic browsers
-  </font>
+<table width="100%" border="0">
+<tr><td align="center" bgcolor="#d1d1d1">
+  <img src="/wb-logo.gif" width="440" height="110" border="0"
+       alt="Web Bridge for classic browsers">
 </td></tr>
 <tr><td bgcolor="#ffffff">
+  <br>
   <font face="Arial,Helvetica,sans-serif" size="2">
-    Search for something, type a web address, or pick a recent site from the list.
+    Search for something, type a web address, or pick from the history list.
     <br><br>
   </font>
   <form method="GET" action="/get">
@@ -3745,7 +3814,7 @@ def _landing_html(ip, user_agent=""):
   -- Returns HTML&nbsp;3.2
 </font>
 <br><br>
-<table width="460" border="0" cellpadding="6" cellspacing="0">
+<table width="440" border="0" cellpadding="6" cellspacing="0">
 <tr><td>
 <font face="Arial,Helvetica,sans-serif" size="1" color="#cc0000">
   <b>Warning:</b> This web bridge fetches and processes remote web pages
@@ -4138,6 +4207,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(200, "text/html; charset=utf-8",
                            landing.encode("utf-8"))
 
+        elif path == "/wb-logo.gif":
+            if _LOGO_GIF:
+                self._send(200, "image/gif", _LOGO_GIF)
+            else:
+                self._send(404, "text/plain", b"logo not available")
+
         elif path == "/get":
             # /get?url=... — used by the address bar form and history
             hist = params.get("hist", [""])[0].strip()
@@ -4493,6 +4568,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # For JS hints, search entire page (may be buried deep in SPAs)
         raw_lower_full = raw.lower()
         has_captcha = any(h in raw_lower_check for h in _CAPTCHA_HINTS)
+        # Large pages (>30 KB) that merely embed a reCAPTCHA widget for a
+        # comment/feedback form are NOT real CAPTCHA gates.  Real CAPTCHA
+        # challenge pages are tiny (<10 KB).  Avoid false positives.
+        if has_captcha and len(raw) > 30000:
+            has_captcha = False
         # Detect JS-disabled pages (any size) and retry with Googlebot
         if not has_captcha and not post_data:
             has_js_hint = any(h in raw_lower_full for h in _JS_DISABLED_HINTS)
@@ -4770,6 +4850,7 @@ if __name__ == "__main__":
         print("  ──────────────────────────────────────")
         if HAS_PIL:
             print("  Images : converted & resized via Pillow")
+            _generate_logo()
         else:
             print("  Images : pass-through (Pillow not installed)")
         print("  Layout : CSS grid/flex → table conversion")
