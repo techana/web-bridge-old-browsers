@@ -2561,10 +2561,16 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
             _vb_w = 0   # viewBox native dimensions
             _vb_h = 0
             for dim_attr, target in [("width", "w"), ("height", "h")]:
-                val = svg_tag.get(dim_attr, "")
+                val = str(svg_tag.get(dim_attr, "")).strip()
                 try:
-                    # Parse float first (e.g. "35.139"), then truncate
-                    n = int(float(re.sub(r"[^0-9.]", "", str(val))))
+                    num = float(re.sub(r"[^0-9.]", "", val))
+                    # Convert relative units to pixels (1em/rem ≈ 16px)
+                    if "em" in val or "rem" in val:
+                        n = int(num * 16)
+                    elif "%" in val:
+                        n = 0  # percentage — ignore, fall back to viewBox
+                    else:
+                        n = int(num)
                     if target == "w":
                         render_w = n
                     else:
@@ -3424,6 +3430,65 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
             first_td = tds[0]
             first_td["width"] = ""
             first_td["colspan"] = str(len(tds))
+
+    # 11a4. Convert wide navigation menus to <select> dropdowns.
+    #       Detect table rows with many (>6) nowrap cells that contain
+    #       only links — these are horizontal nav menus that overflow on
+    #       old 640–800px screens.  Replace with a compact <select>+Go.
+    _NAV_CELL_LIMIT = 6
+    for tbl in list(soup.find_all("table")):
+        for tr in list(tbl.find_all("tr", recursive=False)):
+            tds = tr.find_all("td", recursive=False)
+            if len(tds) <= _NAV_CELL_LIMIT:
+                continue
+            # Check that most cells are link-only (nav pattern)
+            nav_links = []
+            is_nav = True
+            for td in tds:
+                a = td.find("a")
+                if not a:
+                    is_nav = False
+                    break
+                text = td.get_text(strip=True)
+                link_text = a.get_text(strip=True)
+                # Cell should contain mostly just the link text
+                if text and link_text and len(text) <= len(link_text) + 5:
+                    nav_links.append((link_text, a.get("href", "")))
+                else:
+                    is_nav = False
+                    break
+            if not is_nav or len(nav_links) <= _NAV_CELL_LIMIT:
+                continue
+            # Build <select> dropdown + Go button
+            select = soup.new_tag("select", attrs={"name": "url"})
+            select.append(soup.new_tag("option", value="",
+                                       string="-- navigate --"))
+            seen = set()
+            for text, href in nav_links:
+                if href in seen:
+                    continue
+                seen.add(href)
+                opt = soup.new_tag("option", value=href)
+                opt.string = text
+                select.append(opt)
+            form = soup.new_tag("form", method="GET", action="/get")
+            font = soup.new_tag("font", size="2",
+                                face="Arial,Helvetica,sans-serif")
+            font.append(select)
+            font.append(soup.new_tag("input", attrs={"type": "submit",
+                                                      "value": " Go "}))
+            form.append(font)
+            # Replace the entire table (or just the row) with the dropdown
+            # If the table has only this one row, replace the whole table
+            all_rows = tbl.find_all("tr", recursive=False)
+            if len(all_rows) == 1:
+                tbl.replace_with(form)
+            else:
+                # Replace just this row's cells with a single spanning cell
+                new_td = soup.new_tag("td", colspan=str(len(tds)))
+                new_td.append(form)
+                tr.clear()
+                tr.append(new_td)
 
     # 11b. Replace <div> with HTML 3.2 equivalents.
     #      IE2 does not understand <div> and renders its content inline,
