@@ -1,3 +1,6 @@
+[![en](https://img.shields.io/badge/lang-en-red.svg)](https://github.com/techana/web-bridge-old-browsers/blob/master/README.md)
+[![ar](https://img.shields.io/badge/lang-ar-green.svg)](https://github.com/techana/web-bridge-old-browsers/blob/master/README.ar.md)
+
 # Web Bridge for Old Browsers
 
 A lightweight web bridge that fetches modern websites and converts them to
