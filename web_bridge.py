@@ -2518,7 +2518,42 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
                     svg_tag.insert(0, _hc_style)
                 else:
                     _hc_style.string = (_hc_style.string or "") + _hc_css
+            # Fix SVGs that are invisible on white background.
+            # 1) Tailwind "fill-current"/"stroke-current" classes inherit
+            #    color from CSS context which cairosvg doesn't have.
+            # 2) SVGs designed for dark backgrounds use fill="#FFF" (white)
+            #    which becomes invisible on a white JPEG.
+            # Detect white fills and replace with dark color.
+            _svg_cls = " ".join(svg_tag.get("class", []))
+            _needs_recolor = ("fill-current" in _svg_cls
+                              or "stroke-current" in _svg_cls)
+            if not _needs_recolor:
+                # Check if child elements use white fill
+                for _cel in svg_tag.find_all(True):
+                    _cfill = (_cel.get("fill", "") or "").strip().lower()
+                    if _cfill in ("#fff", "#ffffff", "white"):
+                        _needs_recolor = True
+                        break
+            if _needs_recolor:
+                # Replace white/missing fills with dark color
+                for _cel in svg_tag.find_all(True):
+                    _cfill = (_cel.get("fill", "") or "").strip().lower()
+                    if _cfill in ("#fff", "#ffffff", "white"):
+                        _cel["fill"] = "#333"
+                    _cstroke = (_cel.get("stroke", "") or "").strip().lower()
+                    if _cstroke in ("#fff", "#ffffff", "white"):
+                        _cel["stroke"] = "#333"
+                # Also set on root for inheritance
+                if "fill-current" in _svg_cls:
+                    svg_tag["fill"] = "#333"
+                if "stroke-current" in _svg_cls:
+                    svg_tag["stroke"] = "#333"
+
             svg_bytes = str(svg_tag).encode("utf-8")
+            # Fix viewBox case: BeautifulSoup's html.parser lowercases
+            # attributes, turning viewBox into viewbox.  cairosvg needs
+            # the correct camelCase to parse coordinates properly.
+            svg_bytes = svg_bytes.replace(b" viewbox=", b" viewBox=")
             # Determine a reasonable render width from attributes:
             # try width attr, then viewBox, then height attr.
             render_w = 0
@@ -2528,7 +2563,8 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
             for dim_attr, target in [("width", "w"), ("height", "h")]:
                 val = svg_tag.get(dim_attr, "")
                 try:
-                    n = int(re.sub(r"[^0-9]", "", str(val)))
+                    # Parse float first (e.g. "35.139"), then truncate
+                    n = int(float(re.sub(r"[^0-9.]", "", str(val))))
                     if target == "w":
                         render_w = n
                     else:
@@ -2636,6 +2672,20 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
         ccls = " ".join(el.get("class", []))
         if _JUNK_CLS_RE.search(ccls):
             el.decompose()
+
+    # 3d-pre. Extract meta/link info BEFORE unwrapping (meta/link are in
+    #         UNWRAP_TAGS and will lose their attributes after unwrap).
+    _saved_og_site = ""
+    _saved_icon_href = ""
+    _og_m = soup.find("meta", attrs={"property": "og:site_name"})
+    if _og_m:
+        _saved_og_site = _og_m.get("content", "").strip()
+    for _lnk in soup.find_all("link", rel=True):
+        _lrel = " ".join(_lnk.get("rel", []))
+        if "icon" in _lrel.lower():
+            _saved_icon_href = _lnk.get("href", "")
+            if "apple" in _lrel.lower():
+                break  # prefer apple-touch-icon
 
     # 3d. Unwrap tags that may have swallowed article content
     for tag in soup.find_all(UNWRAP_TAGS):
@@ -2833,6 +2883,83 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
                     + site_header_html +
                     '</td></tr></table><hr size="1" noshade>'
                 )
+
+    # 7a2. Fallback: if no HTML header/nav was found (JS-rendered header),
+    #      build a minimal header from meta tags (og:site_name, favicon).
+    if not site_header_html and isinstance(main_el, Tag):
+        _og_site = _saved_og_site
+        # Fallback: extract site name from <title> ("Article - SiteName")
+        if not _og_site:
+            _ttag = soup.find("title")
+            if _ttag:
+                _ttext = _ttag.get_text(strip=True)
+                _sep = None
+                for _s in (" - ", " | ", " – ", " — ", " :: "):
+                    if _s in _ttext:
+                        _sep = _s
+                        break
+                if _sep:
+                    _og_site = _ttext.rsplit(_sep, 1)[-1].strip()
+        _icon_href = _saved_icon_href
+        # Build header if we have at least a site name
+        if _og_site:
+            _fb_parts = []
+            if _icon_href:
+                _icon_abs = _abs(_icon_href, page_url)
+                if _icon_abs:
+                    _fb_parts.append(
+                        '<img src="{}" width="24" height="24" border="0">'
+                        .format(_proxy_img(_icon_abs, proxy_host, 24, 24)))
+            _home_url = urlparse(page_url).scheme + "://" + \
+                urlparse(page_url).netloc + "/"
+            _fb_parts.append(
+                '<b><a href="{}">{}</a></b>'.format(
+                    _proxy_page(_home_url, proxy_host, cp1256), _og_site))
+            # Try to find top-level nav links from the page itself
+            _fb_nav = []
+            _fb_seen = set()
+            _fb_body = soup.find("body")
+            # Look for links in list-like structures near the top of the page
+            for _fb_a in (soup.find_all("a", href=True) if _fb_body
+                          else []):
+                _fb_txt = _fb_a.get_text(strip=True)
+                _fb_href = _fb_a.get("href", "")
+                if not _fb_txt or len(_fb_txt) < 2 or len(_fb_txt) > 30:
+                    continue
+                if _fb_href.startswith(("#", "javascript:")):
+                    continue
+                _fb_abs = _abs(_fb_href, page_url)
+                if not _fb_abs or _fb_abs in _fb_seen:
+                    continue
+                # Only include links to the same site
+                if urlparse(_fb_abs).netloc != urlparse(page_url).netloc:
+                    continue
+                # Skip links that look like article/post links (long paths)
+                _fb_path = urlparse(_fb_abs).path
+                if len(_fb_path) > 30:
+                    continue
+                _fb_seen.add(_fb_abs)
+                _fb_nav.append((_fb_txt, _fb_abs))
+                if len(_fb_nav) >= 10:
+                    break
+            site_header_html = " ".join(_fb_parts)
+            if _fb_nav:
+                _fb_cells = []
+                for _ft, _fh in _fb_nav:
+                    _fph = _proxy_page(_fh, proxy_host, cp1256)
+                    _fb_cells.append(
+                        '<td nowrap><font size="2">'
+                        '<a href="{}">{}</a>'
+                        '</font></td>'.format(_fph, _ft))
+                site_header_html += (
+                    '<br><table border="0" cellpadding="2" '
+                    'cellspacing="0"><tr>' +
+                    "".join(_fb_cells) + '</tr></table>')
+            site_header_html = (
+                '<table width="100%" border="0" cellpadding="4" '
+                'cellspacing="0" bgcolor="#eeeeee"><tr><td>'
+                + site_header_html +
+                '</td></tr></table><hr size="1" noshade>')
 
     # 7b. Rescue site search forms that live outside the main content
     #     (e.g. Wikipedia's search box in the header).  Move them into
@@ -3173,6 +3300,52 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
             cp_hidden["name"] = "cp1256"
             cp_hidden["value"] = "1"
             form.insert(1, cp_hidden)
+
+    # 10b2. Convert DuckDuckGo search POST forms to GET for old browser
+    #       compatibility (IE3 may not send POST hidden fields reliably).
+    #       DDG's HTML version supports both GET and POST.
+    _ddg_host = urlparse(page_url).hostname or ""
+    if "duckduckgo.com" in _ddg_host:
+        for form in list(soup.find_all("form")):
+            if (form.get("method") or "").lower() == "post" and \
+                    form.find("input", attrs={"name": "q"}):
+                form["method"] = "GET"
+                # Remove _proxy_method=POST since we want GET
+                for _pm in form.find_all("input",
+                                         attrs={"name": "_proxy_method"}):
+                    _pm.decompose()
+            # Remove DDG tracking/state forms that have no search input
+            # (they contain visible state_hidden text fields that confuse users)
+            elif form.find("input", attrs={"name": "state_hidden"}):
+                form.decompose()
+
+        # 10b3. Inject visible DDG logo text with link for empty logo anchors.
+        for a in soup.find_all("a", href=True):
+            _a_cls = " ".join(a.get("class", []))
+            if "logo" in _a_cls.lower() and not a.get_text(strip=True) \
+                    and not a.find("img"):
+                _logo_name = a.get("title", "") or "DuckDuckGo"
+                a.string = ""
+                _b = soup.new_tag("b")
+                _b.string = _logo_name
+                _font = soup.new_tag("font", size="5")
+                _font.append(_b)
+                a.append(_font)
+
+    # 10c. Fill in empty <a> links that have a title attribute but no
+    #      visible text or images (e.g. CSS-background logos like DDG).
+    for a in soup.find_all("a", href=True):
+        if not a.get_text(strip=True) and not a.find("img"):
+            _a_title = a.get("title", "")
+            if _a_title:
+                a.string = _a_title
+
+    # 10d. Ensure submit buttons have visible text (old browsers won't
+    #      render a button with empty value).
+    for inp in soup.find_all("input", attrs={"type": "submit"}):
+        if not (inp.get("value") or "").strip():
+            # Use alt or title attribute, or default to "Go"
+            inp["value"] = inp.get("alt") or inp.get("title") or "Go"
 
     # 11. Strip modern/irrelevant attributes from all tags
     for tag in soup.find_all(True):
