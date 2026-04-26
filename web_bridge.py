@@ -59,6 +59,20 @@ except ImportError:
           "Run: pip install readability-lxml")
 
 try:
+    import cairosvg as _cairosvg_check  # noqa: F401  (presence check only)
+    HAS_CAIROSVG = True
+except ImportError:
+    HAS_CAIROSVG = False
+    print("Warning: cairosvg not installed — SVG images will appear as "
+          "1x1 placeholders.  Run: pip install cairosvg")
+except Exception as _e:
+    # cairosvg's import can fail at runtime if libcairo is missing
+    # (different from the Python package being absent).
+    HAS_CAIROSVG = False
+    print("Warning: cairosvg installed but failed to load ({}); "
+          "SVG conversion disabled.".format(_e))
+
+try:
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options as ChromeOptions
     from selenium.webdriver.chrome.service import Service as ChromeService
@@ -4247,6 +4261,33 @@ def _selenium_fetch_image(url):
     return raw, ctype
 
 
+# Pre-compiled patterns for the SVG white-fill recolor pass.  Operates
+# on raw bytes (we don't want to round-trip through a parser for every
+# external SVG).  Matches fill="#fff"|"#ffffff"|"white" (case-insensitive)
+# and the equivalent stroke="..." variants, regardless of attribute
+# quoting style.  fill-current / stroke-current Tailwind classes are
+# also caught because they end up with no fill attr and inherit
+# currentColor, which cairosvg renders as black anyway.
+_SVG_WHITE_FILL_RE = re.compile(
+    rb'(\bfill\s*=\s*)(["\'])(#fff|#ffffff|white)\2',
+    re.I,
+)
+_SVG_WHITE_STROKE_RE = re.compile(
+    rb'(\bstroke\s*=\s*)(["\'])(#fff|#ffffff|white)\2',
+    re.I,
+)
+
+
+def _recolor_white_svg_fills(raw):
+    """Replace explicit white fills/strokes in an SVG with dark grey, so
+    the SVG remains visible after we composite its alpha channel onto
+    a white JPEG background (the bridge's image pipeline always
+    flattens to white because old browsers can't display alpha)."""
+    raw = _SVG_WHITE_FILL_RE.sub(rb'\1\2#333\2', raw)
+    raw = _SVG_WHITE_STROKE_RE.sub(rb'\1\2#333\2', raw)
+    return raw
+
+
 def _fetch_and_convert_image(url, target_w=0, target_h=0):
     """
     Fetch an image URL, resize and convert to JPEG via Pillow.
@@ -4290,12 +4331,20 @@ def _process_image_bytes(raw, ctype, url, target_w=0, target_h=0):
     # SVG: old browsers can't render these at all
     is_svg = "svg" in ctype or url.rstrip("/").lower().endswith(".svg")
     if is_svg:
-        # Try cairosvg → PNG → JPEG
+        if not HAS_CAIROSVG:
+            print("  [SVG] cairosvg not installed; serving placeholder for "
+                  "{}".format(url), flush=True)
+            raise ValueError("SVG cannot be converted (cairosvg missing)")
+        # Try cairosvg → PNG → JPEG.  Pre-process to recolor white fills
+        # (parity with the inline-SVG handler in transform_html): SVG
+        # icons designed for dark UI backgrounds use fill="#fff", which
+        # composited onto our white JPEG background becomes invisible.
         try:
             import cairosvg
+            svg_in = _recolor_white_svg_fills(raw)
             # Use target width for rasterization if available
             render_w = target_w if target_w else 200
-            png_data = cairosvg.svg2png(bytestring=raw,
+            png_data = cairosvg.svg2png(bytestring=svg_in,
                                          output_width=render_w)
             if HAS_PIL:
                 img = Image.open(io.BytesIO(png_data))
@@ -4317,8 +4366,9 @@ def _process_image_bytes(raw, ctype, url, target_w=0, target_h=0):
                 img.save(buf, format="JPEG", quality=75)
                 return buf.getvalue(), "image/jpeg"
             return png_data, "image/png"
-        except Exception:
-            # Can't convert SVG — return empty (will show 1x1 GIF fallback)
+        except Exception as exc:
+            print("  [SVG] cairosvg failed for {} ({}); serving "
+                  "placeholder".format(url, exc), flush=True)
             raise ValueError("SVG cannot be converted")
 
     # GIF: natively supported by all old browsers — pass through as-is
