@@ -4106,6 +4106,108 @@ def _take_screenshot(url, width=SCREENSHOT_W, height=SCREENSHOT_H):
 
 # ── Image proxy ────────────────────────────────────────────────────────────
 
+# Hosts whose image URLs reject plain `requests` (typically because Akamai /
+# Cloudflare bot-fingerprinting blocks Python's TLS handshake from non-Saudi
+# IPs).  For these, fetch images via the same headless Chromium that already
+# renders the parent page — same TLS fingerprint, same session.
+_SELENIUM_IMAGE_HOSTS = frozenset({
+    "saudiexchange.sa", "www.saudiexchange.sa",
+})
+
+# Per-origin shared driver pool — one persistent headless Chromium per
+# distinct origin, reused across image fetches so we don't pay the
+# 2-3 s startup cost per image.  Drivers live until process exit.
+_image_driver_pool = {}              # origin → webdriver.Chrome
+_image_driver_lock = threading.Lock()
+
+# JS run inside the driver to fetch a URL and return its bytes as a
+# base64 string.  Uses FileReader.readAsDataURL so it works for any size
+# blob (no JS string-build overflow).
+_SE_FETCH_JS = """
+const url = arguments[0];
+const cb = arguments[arguments.length - 1];
+fetch(url, {credentials: "include"}).then(r => {
+    const ctype = r.headers.get("content-type") || "";
+    return r.blob().then(blob => {
+        const fr = new FileReader();
+        fr.onloadend = () => {
+            const s = fr.result;
+            const c = s.indexOf(",");
+            cb({ok: r.ok, status: r.status, ctype: ctype,
+                body: c >= 0 ? s.slice(c + 1) : ""});
+        };
+        fr.onerror = () => cb({ok: false, error: "FileReader error"});
+        fr.readAsDataURL(blob);
+    });
+}).catch(e => cb({ok: false, error: String(e)}));
+"""
+
+
+def _selenium_fetch_image(url):
+    """Fetch `url` from inside a headless Chromium scoped to the same
+    origin.  Returns (bytes, content_type).  Raises on failure.
+
+    A driver is created lazily per-origin and reused for every
+    subsequent call to that origin.  The driver navigates to the
+    origin's root page once so the fetch() call below runs same-origin
+    (cookies, CSP) instead of opaque-origin from data:."""
+    if not HAS_SELENIUM:
+        raise RuntimeError("Selenium not available")
+    parsed = urlparse(url)
+    origin = "{}://{}".format(parsed.scheme, parsed.hostname)
+    with _image_driver_lock:
+        driver = _image_driver_pool.get(origin)
+        if driver is None:
+            opts = ChromeOptions()
+            opts.add_argument("--headless=new")
+            opts.add_argument("--no-sandbox")
+            opts.add_argument("--disable-dev-shm-usage")
+            opts.add_argument("--disable-gpu")
+            opts.add_argument("--window-size=400,300")
+            opts.add_argument(
+                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64;"
+                " x64) AppleWebKit/537.36 (KHTML, like Gecko)"
+                " Chrome/120.0.0.0 Safari/537.36")
+            driver = _make_chrome_driver(opts)
+            driver.set_page_load_timeout(FETCH_TIMEOUT + 10)
+            driver.set_script_timeout(FETCH_TIMEOUT + 10)
+            try:
+                driver.get(origin + "/")
+            except Exception:
+                # Navigation timeout is fine — the page has loaded enough
+                # to give us a same-origin context for fetch().
+                pass
+            _image_driver_pool[origin] = driver
+            print("  [Selenium-img] driver ready for {}".format(origin),
+                  flush=True)
+        try:
+            result = driver.execute_async_script(_SE_FETCH_JS, url)
+        except Exception:
+            # Driver may be wedged — drop it so the next call rebuilds.
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            _image_driver_pool.pop(origin, None)
+            raise
+    if not result:
+        raise RuntimeError("Selenium image fetch returned no result")
+    if not result.get("ok"):
+        # Surface enough to diagnose: HTTP status from upstream, JS error, or
+        # both.  Akamai-on-non-Saudi-IP returns 403 here too, in which case
+        # there's nothing the bridge can do — the host needs a Saudi egress.
+        err = result.get("error")
+        status = result.get("status")
+        if err:
+            raise RuntimeError("Selenium image fetch error: {}".format(err))
+        raise RuntimeError(
+            "Selenium image fetch HTTP {}".format(status or "?"))
+    import base64 as _b64
+    raw = _b64.b64decode(result.get("body", "") or "")
+    ctype = (result.get("ctype") or "image/jpeg").split(";")[0].strip()
+    return raw, ctype
+
+
 def _fetch_and_convert_image(url, target_w=0, target_h=0):
     """
     Fetch an image URL, resize and convert to JPEG via Pillow.
@@ -4114,13 +4216,38 @@ def _fetch_and_convert_image(url, target_w=0, target_h=0):
     dimensions (for IE2 which ignores HTML width/height attributes).
     Returns (bytes, content_type) or raises on failure.
     """
+    # Hosts that reject plain requests (Akamai bot detection on TLS
+    # fingerprint) — fetch through the same headless Chromium that
+    # already renders their pages.  Falls back to plain requests if
+    # Selenium isn't available or the in-browser fetch fails.
+    host = (urlparse(url).hostname or "").lower()
+    if HAS_SELENIUM and host in _SELENIUM_IMAGE_HOSTS:
+        try:
+            raw, ctype = _selenium_fetch_image(url)
+            return _process_image_bytes(raw, ctype, url, target_w, target_h)
+        except Exception as exc:
+            print("  [Selenium-img] fetch failed for {} ({}); "
+                  "falling back to requests".format(url, exc), flush=True)
+
     resp = _session.get(
         url, headers=_fetch_headers_for(url), timeout=FETCH_TIMEOUT, stream=True
     )
     resp.raise_for_status()
     raw = resp.content
     ctype = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+    return _process_image_bytes(raw, ctype, url, target_w, target_h)
 
+
+def _process_image_bytes(raw, ctype, url, target_w=0, target_h=0):
+    """Convert raw image bytes to a format old browsers can render.
+
+    Branches on content type / extension:
+      • SVG  → rasterize via cairosvg → JPEG (or PNG if Pillow missing).
+      • GIF  → pass through (natively supported back to IE 2).
+      • else → decode with Pillow, composite alpha, resize, JPEG.
+
+    Shared between the plain `requests` path and the Selenium-fetched
+    path so both produce identical output."""
     # SVG: old browsers can't render these at all
     is_svg = "svg" in ctype or url.rstrip("/").lower().endswith(".svg")
     if is_svg:
