@@ -1753,24 +1753,31 @@ def _youtube_extract(raw, page_url, proxy_host, cp1256=False):
 
     import re as _re, json as _json
 
-    # Extract ytInitialData
-    initial_data = None
-    m = _re.search(r'var ytInitialData = ({.*?});</script>', html_str)
-    if m:
-        try:
-            initial_data = _json.loads(m.group(1))
-        except Exception:
-            pass
+    # Extract ytInitialData / ytInitialPlayerResponse.
+    #
+    # The closing delimiter has shifted across YouTube versions: the
+    # blob is followed by either ";</script>" (older / Googlebot variant)
+    # or ";var meta = " (current desktop Firefox-UA response).  Try the
+    # older form first because it allows non-greedy "})" termination
+    # without any risk of swallowing a sibling assignment, then fall
+    # back to ";var ".  Both anchors are mandatory — without them, "}"
+    # appears thousands of times inside the JSON and the non-greedy
+    # quantifier matches an empty object.
+    def _extract_yt_var(name):
+        for pat in (
+            r'var ' + name + r'\s*=\s*({.*?})\s*;\s*</script>',
+            r'var ' + name + r'\s*=\s*({.*?})\s*;\s*var\s',
+        ):
+            m = _re.search(pat, html_str)
+            if m:
+                try:
+                    return _json.loads(m.group(1))
+                except Exception:
+                    continue
+        return None
 
-    # Extract ytInitialPlayerResponse (video pages)
-    player_data = None
-    m2 = _re.search(r'var ytInitialPlayerResponse = ({.*?});</script>',
-                     html_str)
-    if m2:
-        try:
-            player_data = _json.loads(m2.group(1))
-        except Exception:
-            pass
+    initial_data = _extract_yt_var("ytInitialData")
+    player_data = _extract_yt_var("ytInitialPlayerResponse")
 
     path = parsed.path
     query = dict(urllib.parse.parse_qsl(parsed.query))
@@ -4242,14 +4249,21 @@ def _approx_body_text_len(raw, scan_limit=200000):
     a page is a JS-rendered SPA stub (very little visible text).  On a
     Pi-class host this runs ~10–30× faster than parsing the same chunk
     with html.parser, because we do tag stripping with two compiled
-    regexes and length counting via str.split() in C."""
+    regexes and length counting via str.split() in C.
+
+    Word-length cap: real visible-text "words" (split on whitespace) are
+    short — typically 1–20 chars.  When a <script> block is so large
+    that it overruns scan_limit before its closing </script>, the
+    stripping regex can't match it and the entire JS payload survives
+    as one giant pseudo-word.  YouTube, which packs ~600 KB of JS into
+    the head, is the canonical case.  Capping word length at 30 chars
+    discards JS tokens while keeping every real word."""
     body_idx = _BODY_OPEN_RE.search(raw, 0, 100000)
     start = body_idx.start() if body_idx else 0
     chunk = raw[start:start + scan_limit]
     chunk = _SCRIPT_STYLE_BLOCK_RE.sub(b" ", chunk)
     chunk = _TAG_RE.sub(b" ", chunk)
-    # Whitespace-collapsed length is a good proxy for visible text length.
-    return sum(len(w) for w in chunk.split())
+    return sum(len(w) for w in chunk.split() if len(w) <= 30)
 
 
 # ── HTTP handler ───────────────────────────────────────────────────────────
