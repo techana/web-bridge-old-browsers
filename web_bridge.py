@@ -51,6 +51,14 @@ except ImportError:
     print("Warning: Pillow not installed — images will not be converted.")
 
 try:
+    from readability import Document as _ReadabilityDocument
+    HAS_READABILITY = True
+except ImportError:
+    HAS_READABILITY = False
+    print("Warning: readability-lxml not installed — Reader mode disabled. "
+          "Run: pip install readability-lxml")
+
+try:
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options as ChromeOptions
     from selenium.webdriver.chrome.service import Service as ChromeService
@@ -2350,6 +2358,42 @@ def _extract_apollo_article(soup):
     return None
 
 
+# ── Readability (Mozilla) article extractor ───────────────────────────────
+
+def _readability_extract(raw_html):
+    """Run Mozilla's Readability algorithm (via readability-lxml) on the
+    raw HTML and return (title, body_html_fragment) or None.
+
+    Readability distills the main article content from noisy pages —
+    the same technique used by Firefox Reader View and FrogFind.  We
+    use it as:
+      • primary content source for explicit Reader mode (/r/ route)
+      • a candidate fallback inside transform_html when the existing
+        _find_main() / JSON-LD / Apollo extractors don't find enough.
+    Returns None when the library is unavailable, extraction fails, or
+    the extracted content is too short to be useful."""
+    if not HAS_READABILITY or not raw_html:
+        return None
+    try:
+        if isinstance(raw_html, bytes):
+            raw_html = raw_html.decode("utf-8", errors="replace")
+        doc = _ReadabilityDocument(raw_html)
+        summary = doc.summary(html_partial=True)
+        if not summary:
+            return None
+        # Require a reasonable amount of plain text — homepages and
+        # directory pages typically yield <300 chars and shouldn't
+        # override the existing pipeline.
+        plain = re.sub(r"<[^>]+>", " ", summary)
+        plain = re.sub(r"\s+", " ", plain).strip()
+        if len(plain) < 300:
+            return None
+        title = (doc.short_title() or doc.title() or "").strip()
+        return title, summary
+    except Exception:
+        return None
+
+
 # ── HTML transformer ───────────────────────────────────────────────────────
 
 def transform_html(raw_html, page_url, proxy_host, cp1256=False):
@@ -2444,6 +2488,14 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
     jsonld_fallback = _extract_jsonld_article(soup)
     if not jsonld_fallback:
         jsonld_fallback = _extract_apollo_article(soup)
+
+    # 1d-bis. Mozilla Readability: runs on the raw HTML (before tag
+    #         stripping) and returns a distilled article body.  Used as
+    #         another candidate alongside _find_main / JSON-LD / Apollo —
+    #         the richest one wins later (step 13b).
+    readability_result = _readability_extract(raw_html)
+    readability_fallback = readability_result[1] if readability_result else None
+    readability_title = readability_result[0] if readability_result else ""
 
     # 1e. Preserve <body> visual attributes before processing
     body_tag = soup.find("body")
@@ -3537,15 +3589,40 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
     #      is significantly longer than what the static HTML provides.
     js_only = False
     plain = re.sub(r"<[^>]+>", "", content_html)
-    fallback_plain = re.sub(r"<[^>]+>", "", jsonld_fallback or "")
+    jsonld_plain = re.sub(r"<[^>]+>", "", jsonld_fallback or "")
+    readability_plain = re.sub(r"<[^>]+>", "", readability_fallback or "")
+
+    def _choose_richer(current_html, current_plain, cand_html, cand_plain,
+                       min_len=500, ratio=2):
+        """Return (html, plain) — swap to candidate when it is clearly
+        richer than what we already have."""
+        if (cand_html and len(cand_plain) > min_len
+                and len(cand_plain) > len(current_plain) * ratio):
+            return cand_html, cand_plain
+        return current_html, current_plain
+
     if "undefined" in plain:
+        # SPA stub — pick whichever embedded source we have
         js_only = True
         if jsonld_fallback:
-            content_html = jsonld_fallback
-    elif jsonld_fallback and len(fallback_plain) > len(plain) * 2 and len(fallback_plain) > 500:
-        # Embedded data has much more content than static HTML — use it
-        js_only = True
-        content_html = jsonld_fallback
+            content_html, plain = jsonld_fallback, jsonld_plain
+        if readability_fallback and len(readability_plain) > len(plain):
+            content_html, plain = readability_fallback, readability_plain
+    else:
+        # JSON-LD / Apollo override (existing behaviour)
+        new_html, new_plain = _choose_richer(
+            content_html, plain, jsonld_fallback, jsonld_plain)
+        if new_html is not content_html:
+            js_only = True
+            content_html, plain = new_html, new_plain
+        # Readability override — weaker threshold (1.5x) since Readability
+        # output is already clean and usually more focused than _find_main's
+        # heuristic match.
+        new_html, new_plain = _choose_richer(
+            content_html, plain, readability_fallback, readability_plain,
+            min_len=400, ratio=1.5)
+        if new_html is not content_html:
+            content_html, plain = new_html, new_plain
 
     # 14. Unescape &amp; inside href/src attributes.  BeautifulSoup encodes
     #     & → &amp; in attribute values, but very old browsers (IE2–IE5)
@@ -3968,6 +4045,8 @@ def _page_shell(title, current_url, content_html, proxy_host,
 </td>
 <td align="right" valign="top" nowrap>
   &nbsp;
+  <a href="{reader_href}"><font face="Arial,Helvetica" size="1">[ Reader ]</font></a>
+  &nbsp;
   <a href="http://{proxy_host}/"><font face="Arial,Helvetica" size="1">[ Home ]</font></a>
   &nbsp;
 </td>
@@ -3988,7 +4067,9 @@ def _page_shell(title, current_url, content_html, proxy_host,
            body_alink=(body_attrs or {}).get("alink", "#ff0000"),
            body_bg=' background="{}"'.format(body_bg_img) if body_bg_img else "",
            hist_select=hist_select, cp_checked=cp_checked,
-           proxy_host=proxy_host, meta_charset=meta_charset)
+           proxy_host=proxy_host, meta_charset=meta_charset,
+           reader_href="/{}/{}".format("r1" if cp1256 else "r",
+                                        unquote(current_url)))
 
 
 # ── Screenshot ─────────────────────────────────────────────────────────────
@@ -4312,6 +4393,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._serve_page(url, proxy_host, use_cp1256,
                              post_data=post_data)
 
+        elif path.startswith("/r/") or path.startswith("/r1/"):
+            # /r/http://…  — Reader mode: force Mozilla Readability extraction
+            # /r1/http://… — Reader mode, CP-1256 encoding
+            if path.startswith("/r1/"):
+                url = self.path[4:]
+                use_cp1256 = True
+                try:
+                    url = url.encode("latin-1").decode("cp1256")
+                except (UnicodeDecodeError, UnicodeEncodeError):
+                    pass
+            else:
+                url = self.path[3:]
+                use_cp1256 = False
+                client_ua = self.headers.get("User-Agent", "")
+                if _detect_legacy_os(client_ua) and _is_arabic_page(url):
+                    use_cp1256 = True
+            if not url:
+                self._send(302, location="/")
+                return
+            if not url.startswith(("http://", "https://")):
+                url = "https://" + url
+            url = _google_to_ddg(url)
+            url = _resolve_ddg_redirect(url)
+            self._serve_page(url, proxy_host, use_cp1256, reader=True)
+
         elif path.startswith("/p/") or path.startswith("/p1/"):
             # /p/http://…  — path-based proxy link (no %-encoding)
             # /p1/http://… — same but with CP-1256 mode enabled
@@ -4465,7 +4571,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass
         return None
 
-    def _serve_page(self, url, proxy_host, cp1256=False, post_data=None):
+    def _serve_page(self, url, proxy_host, cp1256=False, post_data=None,
+                    reader=False):
         try:
             if post_data:
                 resp = _session.post(
@@ -4688,6 +4795,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
             )
             self._send(200, "text/html; charset=utf-8", body)
             return
+
+        # Reader mode: bypass specialized extractors (XenForo/Sabq/YouTube)
+        # and run the raw HTML through Mozilla Readability.  The extracted
+        # article is wrapped in a minimal HTML document and handed back to
+        # transform_html, which handles link proxying, image conversion,
+        # tag downgrading and CP-1256 as usual.
+        if reader and HAS_READABILITY:
+            r_result = _readability_extract(raw)
+            if r_result:
+                r_title, r_body = r_result
+                # Preserve the original <title> if Readability didn't find one
+                if not r_title:
+                    try:
+                        _tsoup = BeautifulSoup(raw[:20000], "html.parser")
+                        _tt = _tsoup.find("title")
+                        if _tt:
+                            r_title = _tt.get_text(" ", strip=True)
+                    except Exception:
+                        pass
+                r_doc = (
+                    '<!DOCTYPE html><html><head>'
+                    '<meta charset="utf-8">'
+                    '<title>{}</title></head><body>{}</body></html>'
+                ).format(
+                    (r_title or "").replace("<", "&lt;").replace(">", "&gt;"),
+                    r_body,
+                )
+                raw = r_doc.encode("utf-8")
+            else:
+                # Readability gave nothing useful — fall through to normal
+                # pipeline; _readability_extract will still be a candidate
+                # inside transform_html.
+                pass
 
         # YouTube: extract content from embedded JSON (the page is 100% JS)
         yt = _youtube_extract(raw, url, proxy_host, cp1256)
