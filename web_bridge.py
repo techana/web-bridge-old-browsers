@@ -4028,6 +4028,55 @@ def _page_shell(title, current_url, content_html, proxy_host,
                                         unquote(current_url)))
 
 
+# ── Headless Chrome driver factory ────────────────────────────────────────
+
+def _make_chrome_driver(opts):
+    """Construct a webdriver.Chrome with the most-likely-to-work driver
+    resolver, then progressively fall back.
+
+    Order:
+      1. Selenium Manager (built into Selenium >= 4.6).  No service
+         argument → Selenium auto-downloads a matching chromedriver.
+         Works for both Chrome and Chromium installs.
+      2. webdriver-manager with Chromium-typed lookup (legacy path).
+         Newer Chrome-for-Testing endpoints sometimes return None for
+         Chromium-type entries, in which case .install() raises
+         AttributeError("'NoneType' object has no attribute 'get'") —
+         we catch and try the next path.
+      3. webdriver-manager default lookup (Chrome-type).
+      4. Plain ChromeService() — relies on chromedriver in PATH.
+
+    The first attempt that returns a driver wins.  If all fail, the
+    last exception is re-raised so the caller's logging path can
+    surface it."""
+    last_exc = None
+    # 1. Selenium Manager — modern Selenium handles this transparently
+    try:
+        return webdriver.Chrome(options=opts)
+    except Exception as exc:
+        last_exc = exc
+    if HAS_WDM:
+        # 2. webdriver-manager, Chromium type
+        try:
+            svc = ChromeService(ChromeDriverManager(
+                chrome_type=ChromeType.CHROMIUM).install())
+            return webdriver.Chrome(service=svc, options=opts)
+        except Exception as exc:
+            last_exc = exc
+        # 3. webdriver-manager, default (Chrome) type
+        try:
+            svc = ChromeService(ChromeDriverManager().install())
+            return webdriver.Chrome(service=svc, options=opts)
+        except Exception as exc:
+            last_exc = exc
+    # 4. Plain — rely on chromedriver in PATH
+    try:
+        return webdriver.Chrome(service=ChromeService(), options=opts)
+    except Exception as exc:
+        last_exc = exc
+    raise last_exc
+
+
 # ── Screenshot ─────────────────────────────────────────────────────────────
 
 def _take_screenshot(url, width=SCREENSHOT_W, height=SCREENSHOT_H):
@@ -4039,13 +4088,7 @@ def _take_screenshot(url, width=SCREENSHOT_W, height=SCREENSHOT_H):
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size={},{}".format(width, height))
 
-    if HAS_WDM:
-        service = ChromeService(ChromeDriverManager(
-            chrome_type=ChromeType.CHROMIUM).install())
-    else:
-        service = ChromeService()          # rely on chromedriver in PATH
-
-    driver = webdriver.Chrome(service=service, options=opts)
+    driver = _make_chrome_driver(opts)
     try:
         driver.set_page_load_timeout(FETCH_TIMEOUT)
         driver.get(url)
@@ -4767,12 +4810,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 opts.add_argument("--disable-dev-shm-usage")
                 opts.add_argument("--disable-gpu")
                 opts.add_argument("--window-size=1024,768")
-                if HAS_WDM:
-                    service = ChromeService(ChromeDriverManager(
-                        chrome_type=ChromeType.CHROMIUM).install())
-                else:
-                    service = ChromeService()
-                driver = webdriver.Chrome(service=service, options=opts)
+                driver = _make_chrome_driver(opts)
                 try:
                     driver.set_page_load_timeout(FETCH_TIMEOUT + 10)
                     driver.get(url)
@@ -4904,13 +4942,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64;"
                     " x64) AppleWebKit/537.36 (KHTML, like Gecko)"
                     " Chrome/120.0.0.0 Safari/537.36")
-                if HAS_WDM:
-                    _se_svc = ChromeService(ChromeDriverManager(
-                        chrome_type=ChromeType.CHROMIUM).install())
-                else:
-                    _se_svc = ChromeService()
-                _se_driver = webdriver.Chrome(service=_se_svc,
-                                              options=_se_opts)
+                _se_driver = _make_chrome_driver(_se_opts)
                 try:
                     import time as _tmod
                     _se_driver.set_page_load_timeout(FETCH_TIMEOUT + 15)
