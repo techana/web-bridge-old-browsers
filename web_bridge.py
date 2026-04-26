@@ -3971,7 +3971,7 @@ def _error_page(title, message):
 def _page_shell(title, current_url, content_html, proxy_host,
                 is_rtl=False, cp1256=False, client_ip="",
                 body_bg_img=None, body_bgcolor=None, body_attrs=None,
-                client_ua=""):
+                client_ua="", reader=False):
     escaped_url = current_url.replace('"', "%22").replace("'", "%27")
     safe_title = (
         title
@@ -3995,6 +3995,7 @@ def _page_shell(title, current_url, content_html, proxy_host,
             '{}</select>'.format(hist_opts)
         )
     cp_checked = " checked" if cp1256 else ""
+    reader_checked = " checked" if reader else ""
     meta_charset = ""
     _is_win3x = _detect_legacy_os(client_ua) == "Windows 3.x"
     if cp1256 and not _is_win3x:
@@ -4019,7 +4020,9 @@ def _page_shell(title, current_url, content_html, proxy_host,
   <input type="text" name="url" value="{url}" size="40" dir="ltr">{hist_select}
   <input type="submit" value="Web Bridge">
   <font face="Arial,Helvetica" size="1">
-  <input type="checkbox" name="cp1256" value="1"{cp_checked}> CP-1256</font>
+  <input type="checkbox" name="cp1256" value="1"{cp_checked}> CP-1256
+  &nbsp;
+  <input type="checkbox" name="reader" value="1"{reader_checked}> Reader</font>
   </form>
 </td>
 <td nowrap>
@@ -4039,8 +4042,6 @@ def _page_shell(title, current_url, content_html, proxy_host,
   </form>
 </td>
 <td align="right" valign="top" nowrap>
-  &nbsp;
-  <a href="{reader_href}"><font face="Arial,Helvetica" size="1">[ Reader ]</font></a>
   &nbsp;
   <a href="http://{proxy_host}/"><font face="Arial,Helvetica" size="1">[ Home ]</font></a>
   &nbsp;
@@ -4062,9 +4063,8 @@ def _page_shell(title, current_url, content_html, proxy_host,
            body_alink=(body_attrs or {}).get("alink", "#ff0000"),
            body_bg=' background="{}"'.format(body_bg_img) if body_bg_img else "",
            hist_select=hist_select, cp_checked=cp_checked,
-           proxy_host=proxy_host, meta_charset=meta_charset,
-           reader_href="/{}/{}".format("r1" if cp1256 else "r",
-                                        unquote(current_url)))
+           reader_checked=reader_checked,
+           proxy_host=proxy_host, meta_charset=meta_charset)
 
 
 # ── Headless Chrome driver factory ────────────────────────────────────────
@@ -4580,7 +4580,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # If GET, append them as query parameters.
             extra = {k: v for k, v in params.items()
                      if k not in ("url", "hist", "typed", "cp1256",
-                                  "_proxy_method", "submit")}
+                                  "reader", "_proxy_method", "submit")}
             post_data = None
             orig_method = params.get("_proxy_method", [""])[0].upper()
             if (orig_method == "POST" or self.command == "POST") and extra:
@@ -4616,8 +4616,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 client_ua = self.headers.get("User-Agent", "")
                 if _detect_legacy_os(client_ua) and _is_arabic_page(url):
                     use_cp1256 = True
+            use_reader = params.get("reader", [""])[0] == "1"
             self._serve_page(url, proxy_host, use_cp1256,
-                             post_data=post_data)
+                             post_data=post_data, reader=use_reader)
 
         elif path.startswith("/r/") or path.startswith("/r1/"):
             # /r/http://…  — Reader mode: force Mozilla Readability extraction
@@ -5061,7 +5062,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             html = _page_shell(yt_title, url, yt_content, proxy_host,
                                is_rtl=_yt_rtl, cp1256=yt_cp1256,
                                client_ip=self.client_address[0],
-                               client_ua=self.headers.get("User-Agent", ""))
+                               client_ua=self.headers.get("User-Agent", ""),
+                               reader=reader)
             if yt_cp1256:
                 self._send(200, "text/html; charset=windows-1256",
                            html.encode("cp1256", errors="xmlcharrefreplace"))
@@ -5087,7 +5089,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             html = _page_shell(sabq_title, url, sabq_content, proxy_host,
                                is_rtl=True, cp1256=sabq_cp1256,
                                client_ip=self.client_address[0],
-                               client_ua=self.headers.get("User-Agent", ""))
+                               client_ua=self.headers.get("User-Agent", ""),
+                               reader=reader)
             if sabq_cp1256:
                 self._send(200, "text/html; charset=windows-1256",
                            html.encode("cp1256", errors="xmlcharrefreplace"))
@@ -5175,7 +5178,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                body_bg_img=bg_img,
                                body_bgcolor=bg_color,
                                body_attrs=b_attrs,
-                               client_ua=self.headers.get("User-Agent", ""))
+                               client_ua=self.headers.get("User-Agent", ""),
+                               reader=reader)
             if cp1256:
                 charset = "windows-1256"
                 html_bytes = html.encode("cp1256", errors="xmlcharrefreplace")
