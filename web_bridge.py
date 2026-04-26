@@ -3273,8 +3273,10 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
         # Drop decorative banner/hero imagery: <img> whose filename matches
         # a CMS background-asset naming convention AND has no alt text.
         # Real content images with banner-shaped names have descriptive
-        # alt and survive this check.
-        if (not (alt or "").strip()
+        # alt and survive this check.  src may be None when _real_img_src
+        # couldn't resolve a usable URL (data:, javascript:, etc.) — skip
+        # this filter in that case; later code drops/handles those.
+        if (src and not (alt or "").strip()
                 and _DECORATIVE_IMG_FILENAME_RE.search(src)):
             img.decompose()
             continue
