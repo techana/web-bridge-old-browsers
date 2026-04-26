@@ -168,11 +168,21 @@ def _fetch_headers_for(url):
 _session = requests.Session()
 _session.headers.update(FETCH_HEADERS)
 
-# Cache for rasterized inline SVGs (hash → PNG bytes).
+# Cache for rasterized inline SVGs (hash → JPEG bytes).
 # Old browsers (IE<8) don't support data: URIs, so we serve these via /svg/.
+# Uses OrderedDict for LRU semantics: every cache hit moves the entry to the
+# end, so eviction (when full) discards the genuinely oldest-used entry, not
+# the oldest-inserted one.  A lock guards both reads and writes since the
+# HTTP server is multi-threaded.
 import hashlib as _hashlib
-_svg_cache = {}          # {hex_hash: png_bytes}
-_SVG_CACHE_MAX = 500     # evict oldest when full
+_svg_cache = OrderedDict()    # {hex_hash: jpeg_bytes}, LRU-ordered
+_svg_cache_lock = threading.Lock()
+_SVG_CACHE_MAX = 5000         # ~5000 × ~5 KB = ~25 MB worst case
+                              # (bumped from 500: a busy bridge serving
+                              # SVG-heavy SPAs filled the old limit in a
+                              # handful of page views, evicting entries
+                              # whose <img src="/svg/<hash>.jpg"> tags
+                              # were still being fetched by the client.)
 
 # ── Tag rules ──────────────────────────────────────────────────────────────
 
@@ -2730,10 +2740,15 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
             # Store in cache and reference via /svg/ URL (old browsers
             # don't support data: URIs)
             svg_hash = _hashlib.md5(svg_bytes).hexdigest()
-            if len(_svg_cache) >= _SVG_CACHE_MAX:
-                # evict oldest entry
-                _svg_cache.pop(next(iter(_svg_cache)), None)
-            _svg_cache[svg_hash] = jpg_data
+            with _svg_cache_lock:
+                if svg_hash in _svg_cache:
+                    # Already cached — refresh LRU position
+                    _svg_cache.move_to_end(svg_hash)
+                else:
+                    if len(_svg_cache) >= _SVG_CACHE_MAX:
+                        # Evict the genuinely least-recently-used entry
+                        _svg_cache.popitem(last=False)
+                    _svg_cache[svg_hash] = jpg_data
             img_tag = soup.new_tag("img")
             img_tag["src"] = "http://{}/svg/{}.jpg".format(
                 proxy_host, svg_hash)
@@ -4659,9 +4674,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._serve_page(url, proxy_host, use_cp1256)
 
         elif path.startswith("/svg/"):
-            # /svg/<hash>.jpg — serve rasterized inline SVG from cache
+            # /svg/<hash>.jpg — serve rasterized inline SVG from cache.
+            # On hit, refresh LRU position so frequently-viewed SVGs
+            # don't get evicted by a single page load that brings in a
+            # large batch of new ones.
             svg_key = path[5:].replace(".jpg", "").replace(".png", "")
-            jpg_data = _svg_cache.get(svg_key)
+            with _svg_cache_lock:
+                jpg_data = _svg_cache.get(svg_key)
+                if jpg_data is not None:
+                    _svg_cache.move_to_end(svg_key)
             if jpg_data:
                 self._send(200, "image/jpeg", jpg_data)
             else:
