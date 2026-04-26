@@ -2495,7 +2495,6 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
     #         the richest one wins later (step 13b).
     readability_result = _readability_extract(raw_html)
     readability_fallback = readability_result[1] if readability_result else None
-    readability_title = readability_result[0] if readability_result else ""
 
     # 1e. Preserve <body> visual attributes before processing
     body_tag = soup.find("body")
@@ -3717,64 +3716,6 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
         )
 
     return title, content_html, is_rtl, js_only, body_bg_img, body_bgcolor, body_attrs
-
-
-# ── HTML beautifier (unused) ──────────────────────────────────────────────
-
-# Tags that should start on a new line (block-level elements in HTML 3.2)
-_BLOCK_OPEN_RE = re.compile(
-    r"<(table|tr|td|th|p|ul|ol|li|h[1-6]|hr|br|blockquote|form|center"
-    r"|pre|dl|dt|dd|caption|thead|tbody|tfoot)[\s>/]",
-    re.IGNORECASE,
-)
-_BLOCK_CLOSE_RE = re.compile(
-    r"</(table|tr|td|th|p|ul|ol|li|h[1-6]|blockquote|form|center"
-    r"|pre|dl|dt|dd|caption|thead|tbody|tfoot)>",
-    re.IGNORECASE,
-)
-
-# Tags whose content should be indented
-_INDENT_OPEN = frozenset({
-    "table", "tr", "ul", "ol", "blockquote", "form", "dl",
-    "thead", "tbody", "tfoot",
-})
-_INDENT_CLOSE = frozenset(_INDENT_OPEN)
-
-
-def _beautify_html(html):
-    """
-    Insert newlines and indentation around block-level HTML tags.
-    This helps very old browsers (IE3) that struggle with long
-    unbroken lines of HTML.
-    """
-    # Split HTML into tags and text segments
-    parts = re.split(r"(<[^>]+>)", html)
-    out = []
-    indent = 0
-    for part in parts:
-        if not part:
-            continue
-        # Check for closing block tag — dedent before writing
-        cm = _BLOCK_CLOSE_RE.match(part)
-        if cm and cm.group(1).lower() in _INDENT_CLOSE:
-            indent = max(indent - 1, 0)
-        # Check for opening or closing block tag — put on new line
-        if _BLOCK_OPEN_RE.match(part) or _BLOCK_CLOSE_RE.match(part):
-            out.append("\n" + "  " * indent + part)
-        else:
-            # Preserve text as-is (including leading/trailing spaces
-            # that separate inline tags like " <b>word</b> ")
-            if part.strip():
-                out.append(part)
-        # Check for opening block tag — indent after writing
-        om = _BLOCK_OPEN_RE.match(part)
-        if om and om.group(1).lower() in _INDENT_OPEN:
-            indent += 1
-
-    result = "".join(out)
-    # Collapse runs of blank lines into single blank lines
-    result = re.sub(r"\n{3,}", "\n\n", result)
-    return result.strip()
 
 
 # ── Landing page HTML ──────────────────────────────────────────────────────
