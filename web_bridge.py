@@ -4204,30 +4204,33 @@ def _resolve_ddg_redirect(url):
 
 # ── Page-fetch heuristics (compiled once at import) ───────────────────────
 
-# Captcha/WAF challenge pages: only the first 10 KB is searched, since
-# real challenge pages are tiny (<10 KB) and a recaptcha widget embedded
-# deep in a real article should not trigger this.
-_CAPTCHA_RE = re.compile(
-    rb"captcha-delivery\.com|datadome|challenge-platform|turnstile|"
-    rb"cf-challenge|h-captcha\.com|hcaptcha\.com|awswaf|challenge\.js|"
-    rb"g-recaptcha|recaptcha/api|captcha_challenge", re.I)
+# Substrings that mark a Captcha / WAF challenge page.  Only the first
+# 10 KB of the response is searched (real challenge pages are tiny);
+# a reCAPTCHA widget embedded deep in a real article must not trigger
+# this.  Stored as a tuple of bytes — `b"foo" in raw_lower` uses
+# CPython's memmem, which is dramatically faster than re.IGNORECASE
+# on multi-hundred-KB pages.
+_CAPTCHA_HINTS = (
+    b"captcha-delivery.com", b"datadome", b"challenge-platform",
+    b"turnstile", b"cf-challenge", b"h-captcha.com", b"hcaptcha.com",
+    b"awswaf", b"challenge.js", b"g-recaptcha", b"recaptcha/api",
+    b"captcha_challenge",
+)
 
 # "JavaScript is required / disabled" notices that mean the page is a
-# JS shell — search the whole page (may be buried deep in SPAs).
-_JS_DISABLED_RE = re.compile(
-    rb"javascript is not available|javascript is disabled|"
-    rb"javascript is required|please enable javascript|"
-    rb"you need to enable javascript|enable js and disable|"
-    rb"please turn on javascript", re.I)
+# JS shell — searched across the whole page (may be buried deep in SPAs).
+_JS_DISABLED_HINTS = (
+    b"javascript is not available", b"javascript is disabled",
+    b"javascript is required", b"please enable javascript",
+    b"you need to enable javascript", b"enable js and disable",
+    b"please turn on javascript",
+)
 
 # Wider net for the headless-render fallback (used when the page is
 # already known to be tiny and JS-only).
-_JS_ONLY_RE = re.compile(
-    rb"javascript is not available|javascript is disabled|"
-    rb"javascript is required|please enable javascript|"
-    rb"you need to enable javascript|enable js and disable|"
-    rb"please turn on javascript|enable js|enable javascript|"
-    rb"javascript required", re.I)
+_JS_ONLY_HINTS = _JS_DISABLED_HINTS + (
+    b"enable js", b"enable javascript", b"javascript required",
+)
 
 _HAS_SCRIPT_RE = re.compile(rb"<script\b", re.I)
 _BODY_OPEN_RE = re.compile(rb"<body\b", re.I)
@@ -4702,11 +4705,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # (x.com, etc.) return a JS shell to browsers but serve rendered
         # HTML to crawlers.  Check for "JavaScript is not available/disabled"
         # messages or very small body text with lots of <script> tags.
-        # Patterns _CAPTCHA_RE / _JS_DISABLED_RE / _JS_ONLY_RE are compiled
-        # once at module scope; using regex search avoids allocating a
-        # full-page lowercase copy of `raw` (which on a 1 MB page costs
-        # 1 MB of RAM and a megabyte of memcpy on every request).
-        has_captcha = bool(_CAPTCHA_RE.search(raw, 0, 10000))
+        # Hint tuples (_CAPTCHA_HINTS / _JS_DISABLED_HINTS / _JS_ONLY_HINTS)
+        # are defined once at module scope; we still need a single .lower()
+        # of the page so b"FOO" in lower works case-insensitively, but we
+        # do that .lower() exactly once and reuse the result for every
+        # downstream scan.
+        raw_lower = raw.lower()
+        has_captcha = any(h in raw_lower[:10000] for h in _CAPTCHA_HINTS)
         # Large pages (>30 KB) that merely embed a reCAPTCHA widget for a
         # comment/feedback form are NOT real CAPTCHA gates.  Real CAPTCHA
         # challenge pages are tiny (<10 KB).  Avoid false positives.
@@ -4714,7 +4719,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             has_captcha = False
         # Detect JS-disabled pages (any size) and retry with Googlebot
         if not has_captcha and not post_data:
-            if _JS_DISABLED_RE.search(raw):
+            if any(h in raw_lower for h in _JS_DISABLED_HINTS):
                 try:
                     bot_headers = dict(_fetch_headers_for(url))
                     bot_headers["User-Agent"] = GOOGLEBOT_UA
@@ -4736,7 +4741,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         is_js_stub = (
             not has_captcha
             and len(raw) < 2000
-            and bool(_JS_ONLY_RE.search(raw))
+            and any(h in raw_lower for h in _JS_ONLY_HINTS)
         )
         if not is_js_stub and not has_captcha and len(raw) < 5000:
             # Page is small enough that the byte-scan body-text proxy is
