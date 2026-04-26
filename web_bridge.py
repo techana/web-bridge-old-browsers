@@ -2396,6 +2396,31 @@ def _readability_extract(raw_html):
 
 # ── HTML transformer ───────────────────────────────────────────────────────
 
+# Patterns used inside transform_html.  Hoisted to module scope so they are
+# compiled once at import time rather than on every request.
+_TEMPLATE_RE = re.compile(r"\{\{.*?\}\}")
+_LOADING_RE = re.compile(
+    r"جارٍ تحميل البيانات|Loading\.\.\.|جاري التحميل", re.I)
+_HIGHCHARTS_RE = re.compile(r"highcharts")
+_JUNK_CLS_RE = re.compile(
+    r"\b(share-buttons|ad-space|banner\d|popup|overlay-modal|"
+    r"notification-box|cookie|social-share|article-breif|"
+    r"share-loader|comment_container)\b", re.I)
+_SEARCH_INPUT_TYPE_RE = re.compile(r"^(text|search)$", re.I)
+_CAROUSEL_CLS_RE = re.compile(
+    r"\b(owl-carousel|slick-slider|slick-track|swiper-wrapper|"
+    r"carousel-inner|flickity-slider|glide__slides)\b", re.I)
+_JUNK_IMG_RE = re.compile(
+    r"(close[_-]?icon|share[_-]?loader|spinner|loading|loader|"
+    r"spacer|pixel|blank|arrow[_-]?icon|search[_-]?loader|"
+    r"tools[_-]?logo)\b", re.I)
+_AVATAR_RE = re.compile(
+    r"(avatar|profile[_-]?(?:pic|img|image|photo)|"
+    r"user[_-]?(?:pic|img|image|photo))", re.I)
+_LINK_RE = re.compile(r'<a\s[^>]*href="[^"]*"[^>]*>.*?</a>', re.S)
+_BR_RE = re.compile(r'\s*<br/?>\s*', re.S)
+
+
 def transform_html(raw_html, page_url, proxy_host, cp1256=False):
     """
     Parse and transform raw HTML to old-browser-compatible HTML 3.2.
@@ -2520,9 +2545,7 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
     # 2a. Remove JS framework template text and loading placeholders.
     #     Angular/Vue/Mustache templates like {{expr}} are useless without JS.
     #     Also remove common Arabic/English loading spinners.
-    _TEMPLATE_RE = re.compile(r"\{\{.*?\}\}")
-    _LOADING_RE = re.compile(
-        r"جارٍ تحميل البيانات|Loading\.\.\.|جاري التحميل", re.I)
+    #     (_TEMPLATE_RE / _LOADING_RE are compiled at module scope.)
     for text_node in soup.find_all(string=True):
         if isinstance(text_node, Comment):
             continue
@@ -2545,7 +2568,7 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
             # Inject default styles for Highcharts SVGs — cairosvg
             # doesn't know about the CSS classes Highcharts uses for
             # colors, so charts render as black blobs without this.
-            if svg_tag.find(class_=re.compile(r"highcharts")):
+            if svg_tag.find(class_=_HIGHCHARTS_RE):
                 _hc_style = svg_tag.find("style") or \
                     soup.new_tag("style")
                 _hc_css = (
@@ -2728,10 +2751,7 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
 
     # 3c. Remove elements with classes/ids that indicate non-content
     #     (share buttons, ad spaces, popups, AI summaries, overlays)
-    _JUNK_CLS_RE = re.compile(
-        r"\b(share-buttons|ad-space|banner\d|popup|overlay-modal|"
-        r"notification-box|cookie|social-share|article-breif|"
-        r"share-loader|comment_container)\b", re.I)
+    #     (_JUNK_CLS_RE is compiled at module scope.)
     for el in list(soup.find_all(True, class_=True)):
         if el.attrs is None:
             continue
@@ -3041,8 +3061,8 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
             if main_el in [form] + list(form.parents):
                 continue
             # Look for a text/search input — that's a search form
-            search_input = form.find("input", attrs={"type": re.compile(
-                r"^(text|search)$", re.I)})
+            search_input = form.find("input",
+                                     attrs={"type": _SEARCH_INPUT_TYPE_RE})
             if not search_input:
                 continue
             name = search_input.get("name", "")
@@ -3078,9 +3098,7 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
     # 7d. Convert carousel/slider containers to horizontal tables.
     #     JS carousels (owl-carousel, slick, swiper, etc.) display children
     #     horizontally but without JS they stack vertically.
-    _CAROUSEL_CLS_RE = re.compile(
-        r"\b(owl-carousel|slick-slider|slick-track|swiper-wrapper|"
-        r"carousel-inner|flickity-slider|glide__slides)\b", re.I)
+    #     (_CAROUSEL_CLS_RE is compiled at module scope.)
     for el in list(soup.find_all(True, class_=True)):
         if el.attrs is None:
             continue
@@ -3206,10 +3224,7 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
     _replace_unrenderable_text(soup)
 
     # 9. Fix <img> sources — proxy and cap width; drop SVGs (unconvertible)
-    _JUNK_IMG_RE = re.compile(
-        r"(close[_-]?icon|share[_-]?loader|spinner|loading|loader|"
-        r"spacer|pixel|blank|arrow[_-]?icon|search[_-]?loader|"
-        r"tools[_-]?logo)\b", re.I)
+    #    (_JUNK_IMG_RE is compiled at module scope.)
     for img in soup.find_all("img"):
         # Skip SVG images already converted and proxied in step 2b
         if img.get("data-svg"):
@@ -3276,10 +3291,8 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
         if alt:
             img["alt"] = alt
         # Cap avatar/profile images to 36x36 when no size is specified
+        # (_AVATAR_RE is compiled at module scope.)
         if not width and not height:
-            _AVATAR_RE = re.compile(
-                r"(avatar|profile[_-]?(?:pic|img|image|photo)|"
-                r"user[_-]?(?:pic|img|image|photo))", re.I)
             if _AVATAR_RE.search(src_lower) or _AVATAR_RE.search(alt.lower()):
                 width, height = "36", "36"
         # Resolve final pixel values for width/height.
@@ -3655,8 +3668,7 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
     # 15b. Convert runs of consecutive <a> links separated by <br> into
     #      horizontal table rows.  Nav menus become vertical after div
     #      unwrapping — render them side by side in a single-row table.
-    _LINK_RE = re.compile(r'<a\s[^>]*href="[^"]*"[^>]*>.*?</a>', re.S)
-    _BR_RE = re.compile(r'\s*<br/?>\s*', re.S)
+    #      (_LINK_RE / _BR_RE are compiled at module scope.)
     def _linearize_nav(html):
         """Find runs of 3+ links separated by <br> and wrap in a table."""
         result = []
