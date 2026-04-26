@@ -14,7 +14,8 @@ cairosvg.  YouTube pages are extracted from embedded JSON.
 
 Usage:
     python3 web_bridge.py
-    Then open  http://192.168.1.12:8888  in your old browser.
+    Then open  http://<server-ip>:8888  in your old browser.
+    (the script prints the detected LAN IP on startup)
 
 Requires:
     pip install requests beautifulsoup4 Pillow
@@ -4897,7 +4898,7 @@ if __name__ == "__main__":
             print("  Images : pass-through (Pillow not installed)")
         print("  Layout : CSS grid/flex → table conversion")
         print("  Listening on  http://0.0.0.0:{}".format(PORT))
-        print("  Open          http://192.168.1.12:{}".format(PORT))
+        print("  Open          http://{}:{}".format(SERVER_IP, PORT))
         print("  Stop with     Ctrl-C")
         print()
         try:
