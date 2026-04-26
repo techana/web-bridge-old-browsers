@@ -3809,13 +3809,9 @@ def _generate_logo():
             _los.path.dirname(_los.path.abspath(__file__)), "wb-logo.gif")
         with open(_logo_path, "rb") as _f:
             _LOGO_GIF = _f.read()
-
-        buf = _lio.BytesIO()
-        img.save(buf, "GIF", optimize=True)
-        _LOGO_GIF = buf.getvalue()
-        print("  Logo   : generated ({} bytes)".format(len(_LOGO_GIF)))
+        print("  Logo   : loaded ({} bytes)".format(len(_LOGO_GIF)))
     except Exception as exc:
-        print("  Logo   : generation failed ({})".format(exc))
+        print("  Logo   : load failed ({})".format(exc))
 
 
 def _landing_html(ip, user_agent=""):
