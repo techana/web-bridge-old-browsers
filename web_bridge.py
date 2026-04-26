@@ -2421,6 +2421,20 @@ _JUNK_IMG_RE = re.compile(
     r"(close[_-]?icon|share[_-]?loader|spinner|loading|loader|"
     r"spacer|pixel|blank|arrow[_-]?icon|search[_-]?loader|"
     r"tools[_-]?logo)\b", re.I)
+
+# Filenames that conventionally name a CSS background asset (hero/banner
+# imagery).  When such an <img> survives in the DOM (lazy-load fallback,
+# accessibility shadow DOM, SSR snapshot of an originally CSS-only image)
+# we want to drop it — the original page treated it as decorative.  We
+# only act when the <img> ALSO has no/empty alt text, which is the
+# accessibility-correct marker for "decorative".  Real content images
+# with banner-shaped filenames have descriptive alt text and survive.
+_DECORATIVE_IMG_FILENAME_RE = re.compile(
+    r"/[^/?]*"
+    r"(banners?|heros?|backdrops?|wallpapers?|cover[-_]image)"
+    r"[^/?]*\.(jpe?g|png|gif|webp)(\?|$)",
+    re.I,
+)
 _AVATAR_RE = re.compile(
     r"(avatar|profile[_-]?(?:pic|img|image|photo)|"
     r"user[_-]?(?:pic|img|image|photo))", re.I)
@@ -3241,6 +3255,14 @@ def transform_html(raw_html, page_url, proxy_host, cp1256=False):
         alt    = img.get("alt", "")
         width  = img.get("width", "")
         height = img.get("height", "")
+        # Drop decorative banner/hero imagery: <img> whose filename matches
+        # a CMS background-asset naming convention AND has no alt text.
+        # Real content images with banner-shaped names have descriptive
+        # alt and survive this check.
+        if (not (alt or "").strip()
+                and _DECORATIVE_IMG_FILENAME_RE.search(src)):
+            img.decompose()
+            continue
         # Extract size from inline style (e.g. style="width:65px; height:65px")
         img_style = img.get("style", "")
         if img_style:
